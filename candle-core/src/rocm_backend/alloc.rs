@@ -56,7 +56,7 @@
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rocm_rs::hip::bindings;
@@ -579,8 +579,13 @@ impl VmmPool {
     /// this one query.
     ///
     /// # Errors
-    /// Returns an error if the underlying granularity query fails.
+    /// Returns an error if [`vmm_usable`] reports this runtime cannot back
+    /// a multi-allocation reservation (`ROCm/rocm-systems#2516`), or if the
+    /// underlying granularity query fails.
     pub fn new(device_id: i32) -> Result<Self, HipError> {
+        if !vmm_usable(device_id) {
+            return Err(HipError::new(bindings::hipError_t_hipErrorNotSupported));
+        }
         let granularity = vmm_granularity(device_id)?;
         Ok(Self {
             device_id,
@@ -823,6 +828,110 @@ fn map_physical_pages(
     }
 
     Ok(())
+}
+
+/// Whether this process' HIP runtime can back [`VmmPool`]-style allocations,
+/// i.e. several allocations sharing one `hipMemAddressReserve`d virtual-address
+/// range.
+///
+/// Probes at most once per process for a definitive result (the result is
+/// then cached), so a caller that checks this before every [`VmmPool::new`]
+/// pays for the real HIP calls only until the probe actually completes.
+///
+/// A probe failure that is not itself the defect under test (e.g. the
+/// granularity query or the initial reservation failing outright, which can
+/// happen transiently under GPU resource pressure) is **not** cached: an
+/// `OnceLock` here previously froze that transient failure as "unusable" for
+/// the rest of the process, cascading one bad probe into every later
+/// [`VmmPool::new`] call.
+///
+/// # Errors
+/// Returns `false` (conservatively: treat as unusable) for the current call
+/// if the probe itself fails for a reason other than the defect it is
+/// checking for; the next call retries the probe from scratch.
+#[must_use]
+pub fn vmm_usable(device_id: i32) -> bool {
+    const UNKNOWN: u8 = 0;
+    const USABLE: u8 = 1;
+    const BROKEN: u8 = 2;
+    static STATE: AtomicU8 = AtomicU8::new(UNKNOWN);
+
+    match STATE.load(Ordering::Acquire) {
+        USABLE => true,
+        BROKEN => false,
+        _ => match probe_set_access_defect(device_id) {
+            Ok(true) => {
+                STATE.store(BROKEN, Ordering::Release);
+                false
+            }
+            Ok(false) => {
+                STATE.store(USABLE, Ordering::Release);
+                true
+            }
+            Err(_) => false,
+        },
+    }
+}
+
+/// Whether this HIP runtime fails `hipMemSetAccess` for an allocation that
+/// is not the first in its virtual-address reservation
+/// (`ROCm/rocm-systems#2516`, fixed by `ROCm/rocm-systems#2451`).
+///
+/// Reserves a range sized for a 1-granule and a 2-granule allocation, maps
+/// both into it side by side, and calls `hipMemSetAccess` on each in turn.
+/// The defective runtime validates the requested size against the
+/// reservation's allocations counted from the first one in its own internal
+/// list, rather than from the target allocation, so the second of the two
+/// mapped here always fails that check regardless of which one happens to
+/// be "first" in the runtime's bookkeeping -- one and two granules can never
+/// both legitimately cover each other. A fixed runtime passes both. Frees
+/// everything it allocates, on every path.
+fn probe_set_access_defect(device_id: i32) -> Result<bool, HipError> {
+    let granularity = vmm_granularity(device_id).inspect_err(|e| {
+        eprintln!("DEBUG vmm_granularity failed: {e:?}");
+    })?;
+    eprintln!("DEBUG granularity = {granularity}");
+    let sizes = [granularity, 2 * granularity];
+    let total: usize = sizes.iter().sum();
+    let base = reserve_address_range(total).inspect_err(|e| {
+        eprintln!("DEBUG reserve_address_range({total}) failed: {e:?}");
+    })?;
+
+    let mut broken = false;
+    let mut mapped_ok = Vec::with_capacity(sizes.len());
+    let mut offset = 0usize;
+    for size in sizes {
+        // SAFETY: `dst` lies within the `total`-byte range `base` just
+        // reserved, at a non-overlapping offset for each `size` in `sizes`.
+        let dst = unsafe { base.add(offset) };
+        match map_physical_pages(device_id, dst, size) {
+            Ok(()) => {
+                eprintln!("DEBUG map_physical_pages(size={size}) ok");
+                mapped_ok.push((dst, size));
+            }
+            // `map_physical_pages` already unmapped/released this chunk on
+            // its own failure path; nothing left to clean up for it here.
+            Err(e) => {
+                eprintln!("DEBUG map_physical_pages(size={size}) failed: {e:?}");
+                broken = true;
+            }
+        }
+        offset += size;
+    }
+
+    for (dst, size) in mapped_ok {
+        // SAFETY: each `(dst, size)` here was mapped successfully above and
+        // not yet unmapped.
+        unsafe {
+            let _ = bindings::hipMemUnmap(dst, size);
+        }
+    }
+    // SAFETY: `base` was reserved for exactly `total` bytes above, and every
+    // mapping within it has just been released.
+    unsafe {
+        let _ = bindings::hipMemAddressFree(base, total);
+    }
+    Ok(broken)
 }
 
 /// A pool-scoped device allocation, returned by [`VmmPool::alloc`].
