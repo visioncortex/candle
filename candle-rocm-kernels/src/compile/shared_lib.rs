@@ -1,5 +1,5 @@
-//! Compiling and loading the AMD WMMA MMQ kernels in
-//! `candle-kernels/src/mmq_gguf`.
+//! Compiling and loading the shared kernel sources whose launchers live on
+//! the host: today, the AMD WMMA MMQ kernels in `candle-kernels/src/mmq_gguf`.
 //!
 //! Unlike this crate's other kernels, these sources compile to a shared
 //! library rather than a `--genco` device-only code object: see
@@ -15,13 +15,13 @@ use libloading::Library;
 use std::fs;
 use std::path::Path;
 
-/// One `mmq_gguf` translation unit this crate knows how to compile.
+/// One shared-library translation unit this crate knows how to compile.
 ///
-/// Each variant is its own shared library: the quantize kernel and the
+/// Each variant is its own shared library: `mmq_gguf`'s quantize kernel and
 /// per-dtype instance files were already separate `.cu` files upstream, and
 /// nothing is gained by combining them into one compile.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum MmqGgufUnit {
+pub enum SharedLibUnit {
     /// `mmq_quantize.cu`. `f32 -> block_q8_1_mmq` activation requantization,
     /// shared by every quant type below.
     Quantize,
@@ -47,23 +47,23 @@ pub enum MmqGgufUnit {
     Q6K,
 }
 
-impl MmqGgufUnit {
+impl SharedLibUnit {
     /// `(source, name)` for this unit, the only place the two are tied
     /// together: adding a unit means adding one arm here plus its source
     /// constant in `lib.rs`, instead of keeping two matches in sync.
     fn source_and_name(self) -> (&'static str, &'static str) {
         match self {
-            MmqGgufUnit::Quantize => (crate::MMQ_GGUF_QUANTIZE_SRC, "mmq_gguf_quantize"),
-            MmqGgufUnit::Q4_0 => (crate::MMQ_GGUF_Q4_0_SRC, "mmq_gguf_q4_0"),
-            MmqGgufUnit::Q4_1 => (crate::MMQ_GGUF_Q4_1_SRC, "mmq_gguf_q4_1"),
-            MmqGgufUnit::Q5_0 => (crate::MMQ_GGUF_Q5_0_SRC, "mmq_gguf_q5_0"),
-            MmqGgufUnit::Q5_1 => (crate::MMQ_GGUF_Q5_1_SRC, "mmq_gguf_q5_1"),
-            MmqGgufUnit::Q8_0 => (crate::MMQ_GGUF_Q8_0_SRC, "mmq_gguf_q8_0"),
-            MmqGgufUnit::Q2K => (crate::MMQ_GGUF_Q2_K_SRC, "mmq_gguf_q2_k"),
-            MmqGgufUnit::Q3K => (crate::MMQ_GGUF_Q3_K_SRC, "mmq_gguf_q3_k"),
-            MmqGgufUnit::Q4K => (crate::MMQ_GGUF_Q4_K_SRC, "mmq_gguf_q4_k"),
-            MmqGgufUnit::Q5K => (crate::MMQ_GGUF_Q5_K_SRC, "mmq_gguf_q5_k"),
-            MmqGgufUnit::Q6K => (crate::MMQ_GGUF_Q6_K_SRC, "mmq_gguf_q6_k"),
+            SharedLibUnit::Quantize => (crate::MMQ_GGUF_QUANTIZE_SRC, "mmq_gguf_quantize"),
+            SharedLibUnit::Q4_0 => (crate::MMQ_GGUF_Q4_0_SRC, "mmq_gguf_q4_0"),
+            SharedLibUnit::Q4_1 => (crate::MMQ_GGUF_Q4_1_SRC, "mmq_gguf_q4_1"),
+            SharedLibUnit::Q5_0 => (crate::MMQ_GGUF_Q5_0_SRC, "mmq_gguf_q5_0"),
+            SharedLibUnit::Q5_1 => (crate::MMQ_GGUF_Q5_1_SRC, "mmq_gguf_q5_1"),
+            SharedLibUnit::Q8_0 => (crate::MMQ_GGUF_Q8_0_SRC, "mmq_gguf_q8_0"),
+            SharedLibUnit::Q2K => (crate::MMQ_GGUF_Q2_K_SRC, "mmq_gguf_q2_k"),
+            SharedLibUnit::Q3K => (crate::MMQ_GGUF_Q3_K_SRC, "mmq_gguf_q3_k"),
+            SharedLibUnit::Q4K => (crate::MMQ_GGUF_Q4_K_SRC, "mmq_gguf_q4_k"),
+            SharedLibUnit::Q5K => (crate::MMQ_GGUF_Q5_K_SRC, "mmq_gguf_q5_k"),
+            SharedLibUnit::Q6K => (crate::MMQ_GGUF_Q6_K_SRC, "mmq_gguf_q6_k"),
         }
     }
 
@@ -76,25 +76,29 @@ impl MmqGgufUnit {
     }
 }
 
-/// A loaded `mmq_gguf` shared library.
+/// A loaded [`SharedLibUnit`].
 ///
 /// The field is private and [`compile_and_load`] is the only constructor,
 /// the same shape [`crate::wrappers::SendSyncModule`] uses for the same
 /// reason: the `unsafe impl`s below assert a property of *this* wrapper, not
 /// of `libloading::Library` in general.
-pub struct MmqGgufLibrary(Library);
+pub struct SharedLibrary {
+    lib: Library,
+    /// The unit's name, kept only to say which library a failed lookup hit.
+    name: &'static str,
+}
 
-// SAFETY: this wrapper's only state is a `dlopen` handle, process-wide and
-// not tied to the thread that opened it. `dlsym` is safe to call from any
-// thread against a handle another thread opened, and `Library::get`'s
-// returned `Symbol` borrows `&self` rather than carrying interior
-// mutability, so concurrent lookups through a shared `&MmqGgufLibrary`
-// cannot race.
-unsafe impl Send for MmqGgufLibrary {}
+// SAFETY: this wrapper's only state is a `dlopen` handle (plus a `'static`
+// name), process-wide and not tied to the thread that opened it. `dlsym` is
+// safe to call from any thread against a handle another thread opened, and
+// `Library::get`'s returned `Symbol` borrows `&self` rather than carrying
+// interior mutability, so concurrent lookups through a shared
+// `&SharedLibrary` cannot race.
+unsafe impl Send for SharedLibrary {}
 // SAFETY: see the `Send` impl above.
-unsafe impl Sync for MmqGgufLibrary {}
+unsafe impl Sync for SharedLibrary {}
 
-impl MmqGgufLibrary {
+impl SharedLibrary {
     /// Resolve `symbol` (NUL-terminated, e.g. `b"launch_mmq_gguf_q4_k\0"`) to
     /// a typed function pointer.
     ///
@@ -108,18 +112,20 @@ impl MmqGgufLibrary {
     /// types, argument count and calling convention. A mismatch is undefined
     /// behavior that will not be caught at the call site.
     pub unsafe fn get<T>(&self, symbol: &[u8]) -> Result<libloading::Symbol<'_, T>, KernelError> {
-        self.0.get(symbol).map_err(|e| {
+        self.lib.get(symbol).map_err(|e| {
             KernelError::Compilation(format!(
-                "symbol `{}` not found in mmq_gguf library: {e}",
-                String::from_utf8_lossy(symbol)
+                "symbol `{}` not found in shared library `{}`: {e}",
+                String::from_utf8_lossy(symbol),
+                self.name
             ))
         })
     }
 }
 
-/// Headers staged for an `mmq_gguf` compile: the `hip_shim` entries every
-/// kernel needs (`mmq_common.cuh` itself `#include`s `cuda_fp16.h`/
-/// `cuda_bf16.h`, which the shim shadows) plus `mmq_gguf`'s own four headers.
+/// Headers staged for every [`SharedLibUnit`] compile. All current units are
+/// `mmq_gguf` ones, so this is that set: the `hip_shim` entries every kernel
+/// needs (`mmq_common.cuh` itself `#include`s `cuda_fp16.h`/`cuda_bf16.h`,
+/// which the shim shadows) plus `mmq_gguf`'s own four headers.
 fn staged_headers() -> Vec<(&'static str, &'static str)> {
     crate::HEADERS
         .iter()
@@ -129,7 +135,9 @@ fn staged_headers() -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
-/// The hipcc flags an `mmq_gguf` compile needs beyond `-O3 -std=c++17`.
+/// The hipcc flags every [`SharedLibUnit`] compile gets beyond `-O3 -std=c++17`.
+/// They are not per unit; all current units are `mmq_gguf` ones, and these are
+/// the flags that family needs.
 ///
 /// `GGML_USE_HIP` goes on unconditionally: every `defined(GGML_USE_HIP)`
 /// branch in these sources is how they tell "compiling for AMD" apart from
@@ -165,8 +173,8 @@ pub(crate) fn compile_and_load(
     cache_dir: &Path,
     arch: &str,
     toolchain: &str,
-    unit: MmqGgufUnit,
-) -> Result<MmqGgufLibrary, KernelError> {
+    unit: SharedLibUnit,
+) -> Result<SharedLibrary, KernelError> {
     let headers = staged_headers();
     let src_dir = cache_dir.join(format!("mmq-gguf-src-{}", cache::headers_key(&headers)));
     hipcc::stage_headers(&src_dir, &headers)?;
@@ -174,7 +182,7 @@ pub(crate) fn compile_and_load(
     let flags = compile_flags(arch);
     let flag_refs: Vec<&str> = flags.iter().map(String::as_str).collect();
 
-    let key = cache::mmq_gguf_key(unit.source(), &flag_refs, &headers, arch, toolchain);
+    let key = cache::shared_lib_key(unit.source(), &flag_refs, &headers, arch, toolchain);
     let entry = format!("{}_{key}", unit.name());
     let so_path = cache_dir.join(format!("{entry}.so"));
     let forced = cache::force_recompile();
@@ -206,7 +214,10 @@ pub(crate) fn compile_and_load(
     // `Library::new` call carries; there is nothing library-specific beyond
     // that here.
     unsafe { Library::new(&so_path) }
-        .map(MmqGgufLibrary)
+        .map(|lib| SharedLibrary {
+            lib,
+            name: unit.name(),
+        })
         .map_err(|e| {
             KernelError::Compilation(format!("could not dlopen {}: {e}", so_path.display()))
         })

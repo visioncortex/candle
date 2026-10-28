@@ -31,8 +31,8 @@ pub(crate) const COMPILE_FLAGS: &[&str] = &["--genco", "-O3", "-std=c++17", "-D_
 /// just `quantized.cu`, which is safe because that is the only one of them
 /// that tests for it. The `mmq_gguf` AMD WMMA kernels also test for this
 /// define, but they are not in [`crate::ALL_IDS`] and are not compiled
-/// through this flag set at all: see [`super::KernelCache::mmq_gguf_library`]
-/// for their own, separate compile flags.
+/// through this flag set at all: they are shared-library units, see
+/// [`super::KernelCache::shared_library`] for their own, separate compile flags.
 pub(crate) fn arch_flag(arch: &str) -> Option<String> {
     super::detect::rdna_define(arch).map(|define| format!("-D{define}"))
 }
@@ -71,13 +71,13 @@ pub(crate) fn module_key(
     truncated_hex(hasher)
 }
 
-/// Cache key for one `mmq_gguf` shared-library compile.
+/// Cache key for one shared-library compile.
 ///
-/// Mirrors [`module_key`]'s reasoning but over an `mmq_gguf` unit's own flag
-/// set rather than [`COMPILE_FLAGS`]: those compile to a `-shared` library,
-/// not a `--genco` code object, and carry `-DGGML_USE_HIP`/
-/// `-DAMD_WMMA_AVAILABLE` instead of plain `-DRDNA*`.
-pub(crate) fn mmq_gguf_key(
+/// Mirrors [`module_key`]'s reasoning but over the caller's `flags` rather
+/// than [`COMPILE_FLAGS`]: shared-library compiles produce a `-shared` library,
+/// not a `--genco` code object, and today carry
+/// `-DGGML_USE_HIP`/`-DAMD_WMMA_AVAILABLE` instead of plain `-DRDNA*`.
+pub(crate) fn shared_lib_key(
     source: &str,
     flags: &[&str],
     headers: &[(&str, &str)],

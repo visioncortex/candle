@@ -1,5 +1,5 @@
 use super::{cache, KernelCache, ModuleName};
-use crate::MmqGgufUnit;
+use crate::SharedLibUnit;
 use std::sync::Arc;
 
 /// A source this crate does not own, written in the same dialect as
@@ -175,7 +175,7 @@ fn an_mmq_gguf_unit_compiles_and_resolves() {
         Err(_) => return,
     };
     let lib = cache
-        .mmq_gguf_library(MmqGgufUnit::Q4K)
+        .shared_library(SharedLibUnit::Q4K)
         .expect("mmq_gguf Q4_K unit failed to compile");
     // SAFETY: only resolving the symbol's address, not calling it; the
     // function type is irrelevant to an existence check.
@@ -195,7 +195,7 @@ fn the_mmq_gguf_quantize_unit_exposes_all_three_layouts() {
         Err(_) => return,
     };
     let lib = cache
-        .mmq_gguf_library(MmqGgufUnit::Quantize)
+        .shared_library(SharedLibUnit::Quantize)
         .expect("mmq_gguf quantize unit failed to compile");
     for symbol in [
         &b"launch_mmq_quantize_q8_1_D4\0"[..],
@@ -221,10 +221,10 @@ fn distinct_mmq_gguf_units_do_not_shadow_each_other() {
         Err(_) => return,
     };
     let q4k = cache
-        .mmq_gguf_library(MmqGgufUnit::Q4K)
+        .shared_library(SharedLibUnit::Q4K)
         .expect("mmq_gguf Q4_K unit failed to compile");
     let q6k = cache
-        .mmq_gguf_library(MmqGgufUnit::Q6K)
+        .shared_library(SharedLibUnit::Q6K)
         .expect("mmq_gguf Q6_K unit failed to compile");
     // SAFETY: only resolving symbol addresses, not calling them.
     unsafe {
@@ -250,10 +250,10 @@ fn an_mmq_gguf_unit_is_cached_after_first_compile() {
         Err(_) => return,
     };
     let first = cache
-        .mmq_gguf_library(MmqGgufUnit::Q6K)
+        .shared_library(SharedLibUnit::Q6K)
         .expect("mmq_gguf Q6_K unit failed to compile");
     let second = cache
-        .mmq_gguf_library(MmqGgufUnit::Q6K)
+        .shared_library(SharedLibUnit::Q6K)
         .expect("mmq_gguf Q6_K unit failed to resolve from cache");
     assert!(Arc::ptr_eq(&first, &second));
 }

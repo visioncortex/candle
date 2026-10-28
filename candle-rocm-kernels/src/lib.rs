@@ -20,7 +20,7 @@ mod compile;
 mod error;
 mod wrappers;
 
-pub use compile::{KernelCache, MmqGgufLibrary, MmqGgufUnit, MmqTiles};
+pub use compile::{KernelCache, MmqTiles, SharedLibUnit, SharedLibrary};
 pub use error::KernelError;
 pub use wrappers::SendSyncModule;
 
@@ -149,7 +149,7 @@ pub(crate) const HEADERS: &[(&str, &str)] = &[
 ///
 /// These are compiled separately from [`HEADERS`]/[`ALL_IDS`]: the
 /// `mmq_gguf` sources are built as shared libraries
-/// ([`compile::KernelCache::mmq_gguf_library`]), not `--genco` device-only
+/// ([`compile::SharedLibUnit`], via [`compile::KernelCache::shared_library`]), not `--genco` device-only
 /// code objects, because their `extern "C"` launcher functions use `<<<>>>`
 /// kernel-launch syntax that `--genco` strips along with the rest of the
 /// host code.
@@ -162,7 +162,7 @@ pub(crate) const MMQ_GGUF_HEADERS: &[(&str, &str)] = &[
 
 /// `mmq_quantize.cu`'s source: the `f32 -> block_q8_1_mmq` activation
 /// requantization the `mmq_gguf` kernels read from. Compiled once, shared by
-/// every [`MmqGgufUnit`].
+/// every [`SharedLibUnit`].
 pub(crate) const MMQ_GGUF_QUANTIZE_SRC: &str = mmq_gguf_source!("mmq_quantize.cu");
 
 /// `mmq_instance_q4_0.cu`'s source.

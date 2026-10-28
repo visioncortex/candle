@@ -4,7 +4,7 @@
 //! Mirrors [`super::mmq`]'s shape (requantize the activations, then a tiled
 //! integer matmul against the packed weights) but against the `mmq_gguf`
 //! kernels compiled as a shared library (see
-//! [`candle_rocm_kernels::MmqGgufUnit`]): those run AMD's WMMA matrix-core
+//! [`candle_rocm_kernels::SharedLibUnit`]): those run AMD's WMMA matrix-core
 //! instructions instead of `__dp4a`, and read activations as
 //! [`super::q8_1_mmq`]'s `block_q8_1_mmq` rather than plain `block_q8_1`.
 //!
@@ -22,7 +22,7 @@ use crate::rocm_backend::{
     RocmDevice, RocmStorage, RocmStorageSlice, SendSyncDeviceMemory, WrapErr,
 };
 use crate::{DType, Layout, Result};
-use candle_rocm_kernels::MmqGgufUnit;
+use candle_rocm_kernels::SharedLibUnit;
 use std::ffi::c_void;
 
 /// One GGML quant type WMMA is wired up for: its `mmq_gguf` unit, the
@@ -36,11 +36,11 @@ use std::ffi::c_void;
 /// [`symbol`], [`super::q8_1_mmq::symbol`], the benchmark in
 /// [`super::bench::bench_wmma_vs_dp4a`], and the hardware tests in
 /// `tests_mmq_wmma.rs` all derive from this table, so wiring up a new dtype
-/// only needs one new row here (plus its `MmqGgufUnit` variant and source
+/// only needs one new row here (plus its `SharedLibUnit` variant and source
 /// constant in `candle-rocm-kernels`).
 pub(super) struct WmmaDtype {
     pub(super) dtype: GgmlDType,
-    pub(super) unit: MmqGgufUnit,
+    pub(super) unit: SharedLibUnit,
     pub(super) gguf_symbol: &'static [u8],
     pub(super) quantize_symbol: &'static [u8],
 }
@@ -48,61 +48,61 @@ pub(super) struct WmmaDtype {
 pub(super) const WMMA_DTYPES: &[WmmaDtype] = &[
     WmmaDtype {
         dtype: GgmlDType::Q4_0,
-        unit: MmqGgufUnit::Q4_0,
+        unit: SharedLibUnit::Q4_0,
         gguf_symbol: b"launch_mmq_gguf_q4_0\0",
         quantize_symbol: b"launch_mmq_quantize_q8_1_DS4\0",
     },
     WmmaDtype {
         dtype: GgmlDType::Q4_1,
-        unit: MmqGgufUnit::Q4_1,
+        unit: SharedLibUnit::Q4_1,
         gguf_symbol: b"launch_mmq_gguf_q4_1\0",
         quantize_symbol: b"launch_mmq_quantize_q8_1_DS4\0",
     },
     WmmaDtype {
         dtype: GgmlDType::Q5_0,
-        unit: MmqGgufUnit::Q5_0,
+        unit: SharedLibUnit::Q5_0,
         gguf_symbol: b"launch_mmq_gguf_q5_0\0",
         quantize_symbol: b"launch_mmq_quantize_q8_1_D4\0",
     },
     WmmaDtype {
         dtype: GgmlDType::Q5_1,
-        unit: MmqGgufUnit::Q5_1,
+        unit: SharedLibUnit::Q5_1,
         gguf_symbol: b"launch_mmq_gguf_q5_1\0",
         quantize_symbol: b"launch_mmq_quantize_q8_1_DS4\0",
     },
     WmmaDtype {
         dtype: GgmlDType::Q8_0,
-        unit: MmqGgufUnit::Q8_0,
+        unit: SharedLibUnit::Q8_0,
         gguf_symbol: b"launch_mmq_gguf_q8_0\0",
         quantize_symbol: b"launch_mmq_quantize_q8_1_D4\0",
     },
     WmmaDtype {
         dtype: GgmlDType::Q2K,
-        unit: MmqGgufUnit::Q2K,
+        unit: SharedLibUnit::Q2K,
         gguf_symbol: b"launch_mmq_gguf_q2_k\0",
         quantize_symbol: b"launch_mmq_quantize_q8_1_D2S6\0",
     },
     WmmaDtype {
         dtype: GgmlDType::Q3K,
-        unit: MmqGgufUnit::Q3K,
+        unit: SharedLibUnit::Q3K,
         gguf_symbol: b"launch_mmq_gguf_q3_k\0",
         quantize_symbol: b"launch_mmq_quantize_q8_1_D4\0",
     },
     WmmaDtype {
         dtype: GgmlDType::Q4K,
-        unit: MmqGgufUnit::Q4K,
+        unit: SharedLibUnit::Q4K,
         gguf_symbol: b"launch_mmq_gguf_q4_k\0",
         quantize_symbol: b"launch_mmq_quantize_q8_1_DS4\0",
     },
     WmmaDtype {
         dtype: GgmlDType::Q5K,
-        unit: MmqGgufUnit::Q5K,
+        unit: SharedLibUnit::Q5K,
         gguf_symbol: b"launch_mmq_gguf_q5_k\0",
         quantize_symbol: b"launch_mmq_quantize_q8_1_DS4\0",
     },
     WmmaDtype {
         dtype: GgmlDType::Q6K,
-        unit: MmqGgufUnit::Q6K,
+        unit: SharedLibUnit::Q6K,
         gguf_symbol: b"launch_mmq_gguf_q6_k\0",
         quantize_symbol: b"launch_mmq_quantize_q8_1_D4\0",
     },
@@ -110,7 +110,7 @@ pub(super) const WMMA_DTYPES: &[WmmaDtype] = &[
 
 /// The `mmq_gguf` unit for `dtype`, or `None` if WMMA has not been wired up
 /// for it yet.
-pub(super) fn unit(dtype: GgmlDType) -> Option<MmqGgufUnit> {
+pub(super) fn unit(dtype: GgmlDType) -> Option<SharedLibUnit> {
     WMMA_DTYPES
         .iter()
         .find(|d| d.dtype == dtype)
@@ -118,7 +118,7 @@ pub(super) fn unit(dtype: GgmlDType) -> Option<MmqGgufUnit> {
 }
 
 /// The `launch_mmq_gguf_*` symbol for `unit`.
-fn symbol(unit: MmqGgufUnit) -> &'static [u8] {
+fn symbol(unit: SharedLibUnit) -> &'static [u8] {
     WMMA_DTYPES
         .iter()
         .find(|d| d.unit == unit)
@@ -172,7 +172,7 @@ pub(super) fn mul_mat_via_q8_1_mmq(
     y: &SendSyncDeviceMemory<f32>,
     y_offset: usize,
     dtype: GgmlDType,
-    unit: MmqGgufUnit,
+    unit: SharedLibUnit,
     ncols: usize,
     nrows: usize,
     b_size: usize,
@@ -186,7 +186,7 @@ pub(super) fn mul_mat_via_q8_1_mmq(
     let y_q8_1_mmq = dev.alloc_zeros::<u8>(q8_1_mmq::buffer_bytes(ncols, b_size))?;
     q8_1_mmq::quantize(dtype, y, y_offset, &y_q8_1_mmq, ncols, b_size, dev)?;
 
-    let lib = dev.mmq_gguf_library(unit)?;
+    let lib = dev.shared_library(unit)?;
     // SAFETY: the symbol names an `extern "C"` launcher in the compiled
     // `mmq_gguf` library whose signature is exactly `LaunchFn`; see
     // `candle-kernels/src/mmq_gguf/mmq_instance_q4_k.cu`/`_q6_k.cu`.

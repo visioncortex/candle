@@ -195,13 +195,13 @@ impl RocmDevice {
         self.kernel_manager.amd_cc()
     }
 
-    /// `unit`'s compiled `mmq_gguf` shared library, compiling it on first use;
+    /// `unit`'s compiled shared library, compiling it on first use;
     /// see `quantized::rocm::mmq_wmma`.
-    pub(crate) fn mmq_gguf_library(
+    pub(crate) fn shared_library(
         &self,
-        unit: candle_rocm_kernels::MmqGgufUnit,
-    ) -> Result<std::sync::Arc<candle_rocm_kernels::MmqGgufLibrary>> {
-        self.kernel_manager.mmq_gguf_library(unit).w()
+        unit: candle_rocm_kernels::SharedLibUnit,
+    ) -> Result<std::sync::Arc<candle_rocm_kernels::SharedLibrary>> {
+        self.kernel_manager.shared_library(unit).w()
     }
 
     pub(crate) fn param_cache(&self) -> &super::ParamCache {

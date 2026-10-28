@@ -12,7 +12,7 @@ use super::q8_1::pad;
 use crate::quantized::GgmlDType;
 use crate::rocm_backend::{RocmDevice, SendSyncDeviceMemory, WrapErr};
 use crate::Result;
-use candle_rocm_kernels::MmqGgufUnit;
+use candle_rocm_kernels::SharedLibUnit;
 use std::ffi::c_void;
 
 /// `sizeof(block_q8_1_mmq)`: four `block_q8_1`-equivalent sub-blocks (128
@@ -82,7 +82,7 @@ pub(super) fn quantize(
         Some(symbol) => symbol,
         None => crate::bail!("mmq_gguf: no q8_1_mmq quantize layout for {dtype:?}"),
     };
-    let lib = dev.mmq_gguf_library(MmqGgufUnit::Quantize)?;
+    let lib = dev.shared_library(SharedLibUnit::Quantize)?;
     // SAFETY: `symbol` names an `extern "C"` launcher in the compiled
     // `mmq_gguf` quantize library whose signature is exactly `QuantizeFn`;
     // see `candle-kernels/src/mmq_gguf/mmq_quantize.cu`.
