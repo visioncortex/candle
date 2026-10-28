@@ -191,7 +191,7 @@ nothing else.
 | `CANDLE_ROCM_VERSION` | Overrides the version parsed from `hipcc --version` |
 | `CANDLE_ROCM_CACHE_DIR` | Cache root, overriding `~/.cache/candle-rocm` |
 | `CANDLE_ROCM_FORCE_RECOMPILE` | `1` skips the cache read (the write still happens) |
-| `CANDLE_ROCM_FORCE_DMMV` | Disables both `q8_1` quantized paths (MMVQ *and* MMQ); read in `quantized/rocm/q8_1.rs` |
+| `CANDLE_ROCM_FORCE_DMMV` | Disables both `q8_1` quantized paths (`mmvq_gguf` *and* MMQ); read in `quantized/rocm/q8_1.rs` |
 | `CANDLE_ROCM_CACHE_LIMIT_MB` | Cap in MiB on the allocator's parked free-list bytes; default an eighth of VRAM, `0` removes the cap |
 | `ROCM_PATH` | ROCm install root, default `/opt/rocm` |
 
@@ -251,7 +251,7 @@ the same `candle-kernels` code the CUDA backend launches.
 | `copy_strided_src`, `copy2d`, `const_set` | shared kernel + `hipMemcpy` | contiguous copies go through `hipMemcpy`/`hipMemcpy2D`; a swap of the last two dims takes `transpose2d_*`, see below |
 | `rand_uniform`, `rand_normal` | rocRAND | generated in `f32`/`f64`, then cast |
 | Quantized load / `dequantize` / `dequantize_f16` / `embedding` (`get_rows`) | shared kernel | all GGML block types |
-| Quantized `fwd` (matmul) | MMVQ / DMMV / MMQ / dequantize + GEMM | batch 1-8 fused, larger batches tiled where MMQ pays, prefill-sized f16 batches dense; see below |
+| Quantized `fwd` (matmul) | `mmvq_gguf` / DMMV / MMQ / dequantize + GEMM | batch 1-8 fused, larger batches tiled where MMQ pays, prefill-sized f16 batches dense; see below |
 | `candle-nn`: `softmax_last_dim`, `rms_norm`, `layer_norm`, `sigmoid` | shared kernel | `rocm_fwd` on the custom op; f16/bf16/f32/f64 only |
 | `candle-nn`: `rope`, `rope_i`, `rope_thd` | shared kernel | f16/bf16/f32/f64 only |
 | `candle-nn`: `moe_gemm_gguf` | shared kernel | via `indexed_moe_forward`; see below |
@@ -312,34 +312,31 @@ really changes the result rather than being accepted and ignored.
 
 ### Quantized matmul paths
 
-`QRocmStorage::fwd` picks between four, all against kernels compiled from the
-shared `quantized.cu`:
+`QRocmStorage::fwd` picks between the paths below. The first row is CUDA's
+`fast_mmvq`, from the shared `mmvq_gguf.cu` (see "Compilation and caching");
+the others are kernels compiled from the shared `quantized.cu`:
 
 | batch (`b * m`) | activation | path |
 |---|---|---|
 | 1 | `f32`, K-quant, or under 8 Mi weight elements | DMMV (`dequantize_mul_mat_vec_*`) |
-| 1 | `f32` legacy quant at 8 Mi elements or more | MMVQ (`mul_mat_vec_*_q8_1_cuda1`) |
-| 1 | `f16` / `bf16` | MMVQ, activation cast to `f32` first |
-| 2-8 | any float | MMVQ (`…_cuda<N>`) |
+| 1-8 | any other float | `mmvq_gguf` (`launch_mmvq_gguf_*`), output in the activation dtype |
 | 256 or more | `f16`, under 32 Mi weight elements | dequantize to `f16`, reorient, rocBLAS GEMM |
 | any | any float, weights above the size threshold below | MMQ (`mul_mat_q*`) |
 | any | anything left | dequantize the weights, then rocBLAS GEMM |
 
-Both `q8_1` paths requantize the activations in a separate launch, which costs
-roughly 14 µs; the size and dtype conditions are where that stops paying for
+`mmvq_gguf` quantizes f32, f16 and bf16 activations directly and returns the
+dtype it was given, so a half-precision model pays no cast in either direction.
+Its q8_1 scratch and output are allocated uninitialised. It declines a shape
+whose dimensions overflow the launchers' `int` arguments, and the paths below
+take that.
+
+Both `q8_1` paths requantize the activations in a separate launch, which has a
+fixed cost; the size and dtype conditions are where that stops paying for
 itself. `CANDLE_ROCM_FORCE_DMMV=1` disables both of them, which is an escape
 hatch and how they are benchmarked against the alternatives
 (`quantized::rocm::bench`, `--ignored`).
 
-MMVQ's grid assumes the kernel's `rows_per_cuda_block` is 2 for a batch of two
-or more (`mmvq.rs::launch_shape`). That constant has a 1-row arm, but it is
-gated on `GGML_USE_HIPBLAS && __HIP_PLATFORM_AMD__ && (RDNA2 || RDNA3)`
-(`quantized.cu:2972`) — and while this crate now *does* supply `RDNA3`, it has
-never defined `GGML_USE_HIPBLAS`, so the arm stays off. Defining it would change
-the tile height under a host that still divides by two; the geometry would have
-to be read back the way `mmq_tiles` is.
-
-The batch-of-one conditions are in `quantized/rocm/mmvq.rs::dmmv_is_faster`.
+The batch-of-one conditions are in `quantized/rocm/dmmv.rs::dmmv_is_faster`.
 MMQ's are in `mmq.rs::min_work`, and are a size threshold per dtype rather than
 a batch one — what MMQ saves is the dequantized weight matrix, so the weights
 are what decide it:
@@ -516,10 +513,11 @@ the call's actual `k`.
 These are the things CUDA does and this backend does not. Kept separate from the
 *shared* limitations further down, because conflating the two overstates the gap.
 
-- **The `fast_mmq` / `fast_mmvq` modules.** CUDA-only: they bind to
-  `mmvq_gguf.cu` / `mmq_gguf/`, which use inline PTX (`ldmatrix.sync.aligned…`
-  in `mmq_gguf/mmq_mma.cuh`), `nvcuda::wmma` and `__reduce_add_sync`. The plain
-  `mul_mat_q*` kernels this backend does launch are the older, portable ones.
+- **CUDA's `fast_mmq` outside RDNA3/RDNA4.** The `mmq_gguf/` kernels are
+  reached through `quantized/rocm/mmq_wmma.rs`, which needs AMD's WMMA matrix
+  instructions, so only RDNA3 and RDNA4 take it. Every other device runs the
+  older, portable `mul_mat_q*` kernels (`mmq.rs`). The `ldmatrix.sync.aligned`
+  PTX in `mmq_gguf/mmq_mma.cuh` is NVIDIA-only.
 - **The dense fused MoE GEMM** (`candle_nn::moe::moe_gemm`, and the prefill half
   of `moe_gemm_gguf`). Both bind to `candle-kernels/src/moe/moe_wmma.cu` and
   `moe_wmma_gguf.cu`, which are `nvcuda::wmma` plus `<mma.h>` and are compiled
@@ -611,8 +609,9 @@ kept below with the fix noted, since the point is the report.
    past the end of the buffer, so it corrupted silently. CUDA was exposed at
    every odd `nrows` with a batch of 2-8; ROCm dodged it by declining the shape.
    `quantized.cu` now carries the full guard plus a clamp on the phantom row's
-   load, `mmvq.rs::supports` no longer needs its parity fallback, and
-   `odd_output_rows_stay_correct` covers the shapes it now serves.
+   load. The ROCm launcher that dodged the bug by declining the shape has since
+   been replaced by `mmvq_gguf`, and `odd_output_rows_stay_correct` covers the
+   odd row counts it serves.
    `mmvq_gguf.cu`, CUDA's `fast_mmvq` kernel, had the store guard but not the
    load clamp: its phantom row read up to a whole weight row past the buffer,
    whose padding covers only 512 elements. It carries the same clamp now.
@@ -653,7 +652,7 @@ Everything is driven from the repo-root `Makefile`:
 `ROCM_FILTER` defaults to `rocm`, not `_rocm`. The narrower spelling matched the
 integration suites' `..._rocm` suffix but none of the backend's own module
 tests, which are named for what they check and carry `rocm` only in their module
-path (`quantized::rocm::tests_mmvq::…`) — so `test-rocm-core` was running 5 lib
+path (`quantized::rocm::tests_fast_mmvq::…`) — so `test-rocm-core` was running 5 lib
 tests and skipping 92. `ROCM_TEST_THREADS` defaults to 1 so that GPU memory use
 and the attribution of a failure stay predictable; the disk cache is locked per
 entry, so concurrency is safe, just noisier.

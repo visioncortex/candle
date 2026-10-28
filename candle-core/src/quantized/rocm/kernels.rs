@@ -8,7 +8,7 @@
 //! untouched.
 //!
 //! Dequantization and row gathering live here; the two matrix-vector paths are
-//! in [`super::dmmv`] and [`super::mmvq`].
+//! in [`super::dmmv`] and [`super::fast_mmvq`].
 
 use crate::quantized::GgmlDType;
 use crate::rocm_backend::rocm_rs::hip::Dim3;

@@ -8,7 +8,7 @@
 //! ```
 //!
 //! `CANDLE_ROCM_FORCE_DMMV=1` in the environment pins the decode shapes to the
-//! DMMV kernel, which is how the DMMV and MMVQ paths are compared.
+//! DMMV kernel, which is how DMMV and `mmvq_gguf` are compared.
 //!
 //! [`super::bench_prefill`] holds the prefill-scale sweep and shares the timing
 //! helpers below; the filter above picks up both files.
@@ -55,9 +55,10 @@ fn time_matmul(
     Ok(start.elapsed().as_secs_f64() * 1e3 / iters as f64)
 }
 
-/// The two decode launchers side by side on the same weights, bypassing the
+/// The decode launchers side by side on the same weights, bypassing the
 /// dispatch in [`super::QRocmStorage::fwd`] (which only ever picks one of
-/// them). This is what `MMVQ_MIN_WORK` is calibrated against.
+/// them). This is what `dmmv::dmmv_is_faster` is calibrated against. `fast_ms`
+/// is [`super::fast_mmvq`].
 #[test]
 #[ignore = "benchmark: needs a GPU and takes seconds"]
 fn bench_decode_paths() -> Result<()> {
@@ -68,7 +69,7 @@ fn bench_decode_paths() -> Result<()> {
     };
     println!(
         "{:>6} {:>7} {:>6} {:>4} {:>10} {:>10}",
-        "dtype", "k", "n", "m", "dmmv_ms", "mmvq_ms"
+        "dtype", "k", "n", "m", "dmmv_ms", "fast_ms"
     );
     // SmolLM2-360M (hidden 960, ffn 2560, vocab 49152) and a 7B-ish shape.
     let shapes = [
@@ -111,9 +112,8 @@ fn bench_decode_paths() -> Result<()> {
                 } else {
                     f64::NAN
                 };
-                let mmvq_ms = time(&device, 200, || {
-                    super::mmvq::mul_mat_vec_via_q8_1(&q.data, q.len, &y, 0, dtype, k, n, m, &dev)
-                        .map(|_| ())
+                let fast_ms = time(&device, 200, || {
+                    super::fast_mmvq::mul_mat_vec::<f32>(q, &y, 0, (k, n), m).map(|_| ())
                 })?;
                 println!(
                     "{:>6} {:>7} {:>6} {:>4} {:>10.4} {:>10.4}",
@@ -122,7 +122,7 @@ fn bench_decode_paths() -> Result<()> {
                     n,
                     m,
                     dmmv_ms,
-                    mmvq_ms
+                    fast_ms
                 );
             }
         }

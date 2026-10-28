@@ -6,13 +6,12 @@
 //!
 //! Matrix multiplication takes one of four paths, tried in this order:
 //!
-//! * [`mmvq`] — a batch of one to eight rows against the packed weights, with
-//!   the activations requantized to `q8_1`. Covers f32, f16 and bf16
-//!   activations and every dtype with an `mul_mat_vec_*_q8_1_cuda<N>` kernel.
-//!   It declines a batch of one where DMMV is cheaper, which is most of a
-//!   decode step; see `mmvq::dmmv_is_faster`.
+//! * [`fast_mmvq`] — CUDA's `mmvq_gguf.cu` decode kernels, for a batch of one
+//!   to eight rows. It takes f32, f16 and bf16 activations as they are and
+//!   answers in the same dtype, with no cast and no memset. It leaves a batch
+//!   of one f32 row to DMMV where `dmmv::dmmv_is_faster`.
 //! * [`dmmv`] — the fused dequantize-and-GEMV, for a single f32 activation row.
-//!   No requantization, so it is also the more accurate of the two.
+//!   No requantization, so it is also more accurate than the `q8_1` paths.
 //! * [`mmq`] — the tiled `q8_1` matmul, for the batches the vector kernels do
 //!   not cover. This is prefill. It declines the weight matrices too small to
 //!   beat a rocBLAS GEMM, which for most dtypes means only the ones below the
@@ -36,10 +35,10 @@ use crate::{CpuStorage, DType, Layout, Result, Shape};
 mod dense;
 mod device_ptr;
 mod dmmv;
+mod fast_mmvq;
 mod kernels;
 mod mmq;
 mod mmq_wmma;
-mod mmvq;
 mod moe;
 mod q8_1;
 mod q8_1_mmq;
@@ -59,13 +58,13 @@ mod tests_dense;
 #[cfg(test)]
 mod tests_device_ptr;
 #[cfg(test)]
+mod tests_fast_mmvq;
+#[cfg(test)]
 mod tests_imatrix;
 #[cfg(test)]
 mod tests_mmq;
 #[cfg(test)]
 mod tests_mmq_wmma;
-#[cfg(test)]
-mod tests_mmvq;
 
 pub struct QRocmStorage {
     /// Quantized payload followed by `MATRIX_ROW_PADDING` elements worth of
@@ -321,9 +320,9 @@ impl QRocmStorage {
         };
 
         let b_size = b * m;
-        if b_size <= mmvq::MAX_BATCH {
-            if let Some(dst) = mmvq::try_fwd(self, n, k, b_size, storage, layout)? {
-                return Ok(wrap(dst));
+        if b_size <= fast_mmvq::MAX_BATCH {
+            if let Some(out) = fast_mmvq::try_fwd(self, n, k, b_size, storage, layout)? {
+                return Ok((out, Shape::from(out_shape.clone())));
             }
         }
 

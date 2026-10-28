@@ -224,9 +224,9 @@ fn embedding_honours_the_ids_offset() -> Result<()> {
 /// tests use a relative 2%.
 ///
 /// Reaching that fallback at all takes a shape all three fused paths decline.
-/// `m` is past [`mmvq::MAX_BATCH`], which rules out MMVQ and DMMV; `Q2K` with
-/// `k = 256` then rules out MMQ, whose column loop steps 512 elements at a time
-/// for that dtype. Q4K here would be claimed by MMQ.
+/// `m` is past [`fast_mmvq::MAX_BATCH`], which rules out `mmvq_gguf` and DMMV;
+/// `Q2K` with `k = 256` then rules out MMQ, whose column loop steps 512
+/// elements at a time for that dtype. Q4K here would be claimed by MMQ.
 #[test]
 fn fwd_matches_a_dequantized_matmul() -> Result<()> {
     let dev = rocm_device!();
@@ -284,8 +284,8 @@ fn deq_reads_unaligned_buffers() -> Result<()> {
 
 /// The fused DMMV kernel against the same dequantize-then-matmul reference.
 ///
-/// `QMatMul::forward` no longer reaches DMMV for these shapes — [`mmvq`] claims
-/// every batch of eight or fewer — so the launcher is called directly.
+/// The launcher is called directly rather than through `QMatMul::forward`, so
+/// the kernel under test is not the dispatch's choice.
 ///
 /// The kernels reduce with `__shfl_xor(width = 32)` and index lanes below 32,
 /// which is what makes them correct on a 32-lane RDNA wavefront; this pins that

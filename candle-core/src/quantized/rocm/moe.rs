@@ -3,8 +3,9 @@
 //! The weights are a single `(num_experts, n, k)` quantized tensor; `ids` picks
 //! which expert each of the `batch * topk` routed tokens goes to. The kernel is
 //! `indexed_moe_forward_*_q8_1` in `candle-kernels/src/quantized.cu` — the same
-//! `vec_dot_q*_q8_1` inner loop [`super::mmvq`] uses, with the expert index
-//! folded into the weight pointer, so it inherits MMVQ's `q8_1` activation
+//! `vec_dot_q*_q8_1` inner loop `quantized.cu`'s MMVQ kernels use, with the
+//! expert index folded into the weight pointer, so it inherits their `q8_1`
+//! activation
 //! requantization wholesale (see [`super::q8_1`]).
 //!
 //! Mirrors `quantized/cuda.rs::indexed_moe_forward_fused_q8_1_input`.

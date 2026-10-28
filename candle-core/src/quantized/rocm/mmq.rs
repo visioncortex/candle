@@ -1,4 +1,4 @@
-//! MMQ: the tiled `q8_1` matmul, for a batch past what [`super::mmvq`] covers.
+//! MMQ: the tiled `q8_1` matmul, for a batch past what [`super::fast_mmvq`] covers.
 //!
 //! This is prefill. The vector kernels stop at a batch of eight, so before this
 //! path existed a prompt of any length dequantized the whole weight matrix into
@@ -9,7 +9,7 @@
 //! `mul_mat_q` blocks the weights instead: each workgroup loads an
 //! `mmq_y x WARP_SIZE` tile of packed blocks into LDS, dequantizes nothing, and
 //! accumulates `mmq_x` output columns through `__dp4a`. The activations reach it
-//! as `q8_1` from [`super::q8_1`], the same requantization MMVQ uses.
+//! as `q8_1` from [`super::q8_1`], the same requantization the MoE path uses.
 //!
 //! Kernel signature and launch geometry are taken from
 //! `quantized/cuda.rs::mul_mat_via_q8_1` rather than inferred. The tile sizes

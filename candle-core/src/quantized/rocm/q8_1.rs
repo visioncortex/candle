@@ -1,6 +1,7 @@
-//! The `q8_1` activation requantization both integer matmul paths share.
+//! The `q8_1` activation requantization the MMQ and MoE paths share.
 //!
-//! [`super::mmvq`] and [`super::mmq`] differ only in what they do *after* this:
+//! [`super::fast_mmvq`] has its own, in `mmvq_gguf.cu`. [`super::mmq`] and
+//! [`super::moe`] differ only in what they do *after* this:
 //! the activations go to `q8_1` once, and the dot products then run in integer
 //! SIMD (`__dp4a`, one `v_dot4_i32_iu8` per step on gfx11+) against the packed
 //! weights, rather than dequantizing those weights into a float matrix.
@@ -24,8 +25,8 @@ pub(super) fn pad(p: usize, q: usize) -> usize {
     p.div_ceil(q) * q
 }
 
-/// Set `CANDLE_ROCM_FORCE_DMMV=1` to disable every `q8_1` path — MMVQ and MMQ
-/// both — leaving [`super::dmmv`] and the dense dequantize.
+/// Set `CANDLE_ROCM_FORCE_DMMV=1` to disable every `q8_1` path — `mmvq_gguf`
+/// and MMQ both — leaving [`super::dmmv`] and the dense dequantize.
 ///
 /// DMMV does not requantize the activations, so it is the reference when an
 /// accuracy question comes up, and it is how the paths are benchmarked against
