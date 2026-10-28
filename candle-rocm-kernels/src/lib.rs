@@ -194,3 +194,8 @@ pub(crate) const MMQ_GGUF_Q5_K_SRC: &str = mmq_gguf_source!("mmq_instance_q5_k.c
 
 /// `mmq_instance_q6_k.cu`'s source.
 pub(crate) const MMQ_GGUF_Q6_K_SRC: &str = mmq_gguf_source!("mmq_instance_q6_k.cu");
+
+/// `mmvq_gguf.cu`'s source: CUDA's `fast_mmvq` decode kernels. Built as a
+/// shared library for the same reason as the `mmq_gguf` sources: its
+/// launchers are `extern "C"` host functions using `<<<>>>`.
+pub(crate) const MMVQ_GGUF_SRC: &str = shared_source!("mmvq_gguf.cu");

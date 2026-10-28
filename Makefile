@@ -1,7 +1,7 @@
 .PHONY: clean-ptx clean test all \
         check check-cuda check-rocm check-all \
         fmt fmt-check clippy clippy-rocm \
-        test-rocm test-rocm-core test-rocm-nn test-rocm-suite \
+        test-rocm test-rocm-core test-rocm-nn test-rocm-kernels test-rocm-suite \
         rocm-info rocm-cache-clean rocm-shim-test
 
 CARGO ?= cargo
@@ -65,7 +65,13 @@ test-rocm-core:
 test-rocm-nn:
 	$(CARGO) test -p candle-nn --features rocm -- $(ROCM_FILTER) --test-threads=$(ROCM_TEST_THREADS)
 
-test-rocm: test-rocm-core test-rocm-nn
+# candle-rocm-kernels is outside the workspace, so neither `test` nor the
+# targets above reach it. --show-output surfaces each test's skip note when
+# there is no GPU or hipcc.
+test-rocm-kernels:
+	$(CARGO) test --manifest-path candle-rocm-kernels/Cargo.toml -- --test-threads=$(ROCM_TEST_THREADS) --show-output
+
+test-rocm: test-rocm-core test-rocm-nn test-rocm-kernels
 
 # Run one candle-core suite against the GPU, e.g. make test-rocm-suite SUITE=conv_tests
 test-rocm-suite:
@@ -73,7 +79,9 @@ test-rocm-suite:
 
 # Compiles every shared candle-kernels source with hipcc and checks the
 # hand-written device code in the shim (16-bit atomicAdd, the *_sync shuffle
-# macros, __dp4a) on the actual GPU.
+# macros, __dp4a) on the actual GPU. mmvq_gguf.cu is built as a shared library
+# instead of a code object: its launchers are host code, which --genco drops,
+# so this is how shared_lib.rs builds it at runtime.
 ROCM_ARCH ?= $(shell rocminfo 2>/dev/null | grep -om1 'gfx[0-9a-z]*')
 # Read from COMPILE_FLAGS rather than repeated here: compiling the shim test at
 # a different __CUDA_ARCH__ than the runtime compiler uses would test a
@@ -84,11 +92,14 @@ rocm-shim-test:
 	test -n "$(ROCM_ARCH_DEFINE)" || { echo "could not read __CUDA_ARCH__ from cache.rs"; exit 1; }; \
 	tmp=$$(mktemp -d); trap 'rm -rf $$tmp' EXIT; \
 	for f in candle-kernels/src/*.cu; do \
-	  case $$f in *mmvq_gguf.cu) continue;; esac; \
 	  n=$$(basename $$f .cu); printf '%-12s' "$$n"; \
-	  hipcc --genco --offload-arch=$(ROCM_ARCH) -O3 -std=c++17 $(ROCM_ARCH_DEFINE) \
+	  case $$f in \
+	    *mmvq_gguf.cu) mode="-shared -fPIC"; out=$$tmp/$$n.so;; \
+	    *) mode=--genco; out=$$tmp/$$n.hsaco;; \
+	  esac; \
+	  hipcc $$mode --offload-arch=$(ROCM_ARCH) -O3 -std=c++17 $(ROCM_ARCH_DEFINE) \
 	    -include $$shim/hip_compat.h -I $$shim -I candle-kernels/src \
-	    -o $$tmp/$$n.hsaco $$f 2>$$tmp/$$n.err \
+	    -o $$out $$f 2>$$tmp/$$n.err \
 	    && echo "compiled" || { echo "FAILED"; sed -n '1,20p' $$tmp/$$n.err; exit 1; }; \
 	done; \
 	hipcc --offload-arch=$(ROCM_ARCH) -std=c++17 -I $$shim -o $$tmp/shim_test $$shim/shim_test.hip \

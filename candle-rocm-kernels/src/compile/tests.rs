@@ -35,6 +35,19 @@ fn custom_key(name: &str, source: &str) -> ModuleName {
     }
 }
 
+/// Device 0's cache, or `None` after noting on stderr which test skipped
+/// and why, so a missing GPU or `hipcc` is not a silent "ok".
+fn gpu_cache() -> Option<KernelCache> {
+    match KernelCache::new(0) {
+        Ok(cache) => Some(cache),
+        Err(e) => {
+            let test = std::thread::current().name().unwrap_or("?").to_owned();
+            eprintln!("skipping {test}: {e}");
+            None
+        }
+    }
+}
+
 /// The in-memory key has to separate two sources sharing a name — the same
 /// statement `a_revised_source_is_not_shadowed_by_the_name_it_reuses` makes
 /// end to end, but without a GPU, so it runs everywhere.
@@ -49,10 +62,8 @@ fn a_custom_key_separates_two_sources_under_one_name() {
 /// cache the built-ins use — the whole point of the custom entry point.
 #[test]
 fn a_custom_source_compiles_and_resolves() {
-    let cache = match KernelCache::new(0) {
-        Ok(cache) => cache,
-        // No ROCm device on this machine.
-        Err(_) => return,
+    let Some(cache) = gpu_cache() else {
+        return;
     };
     cache
         .custom_function("candle_rocm_kernels_test", CUSTOM, "custom_scale_f32")
@@ -68,9 +79,8 @@ fn a_custom_source_compiles_and_resolves() {
 /// missing, or worse, still there and stale.
 #[test]
 fn a_revised_source_is_not_shadowed_by_the_name_it_reuses() {
-    let cache = match KernelCache::new(0) {
-        Ok(cache) => cache,
-        Err(_) => return,
+    let Some(cache) = gpu_cache() else {
+        return;
     };
     cache
         .custom_function("candle_rocm_kernels_revision", CUSTOM, "custom_scale_f32")
@@ -94,9 +104,8 @@ fn a_revised_source_is_not_shadowed_by_the_name_it_reuses() {
 /// candle's `unary` instead — a wrong-kernel launch, not an error.
 #[test]
 fn a_custom_module_does_not_shadow_a_built_in_of_the_same_name() {
-    let cache = match KernelCache::new(0) {
-        Ok(cache) => cache,
-        Err(_) => return,
+    let Some(cache) = gpu_cache() else {
+        return;
     };
     // Load the custom one first, so a shared namespace would poison the
     // built-in lookup rather than the other way round.
@@ -118,10 +127,8 @@ fn a_custom_module_does_not_shadow_a_built_in_of_the_same_name() {
 /// resolved. Ten threads racing on one module is what reproduced them.
 #[test]
 fn concurrent_first_use_of_a_module_is_safe() {
-    let cache = match KernelCache::new(0) {
-        Ok(cache) => Arc::new(cache),
-        // No ROCm device on this machine.
-        Err(_) => return,
+    let Some(cache) = gpu_cache().map(Arc::new) else {
+        return;
     };
     let handles: Vec<_> = (0..10)
         .map(|_| {
@@ -149,9 +156,8 @@ fn concurrent_first_use_of_a_module_is_safe() {
 /// shape for the life of the process.
 #[test]
 fn a_compile_gate_is_released_once_its_module_is_resident() {
-    let cache = match KernelCache::new(0) {
-        Ok(cache) => cache,
-        Err(_) => return,
+    let Some(cache) = gpu_cache() else {
+        return;
     };
     cache
         .function(&crate::UNARY, "ucopy_f32")
@@ -169,10 +175,8 @@ fn a_compile_gate_is_released_once_its_module_is_resident() {
 /// `--genco` object has no such symbol to resolve.
 #[test]
 fn an_mmq_gguf_unit_compiles_and_resolves() {
-    let cache = match KernelCache::new(0) {
-        Ok(cache) => cache,
-        // No ROCm device on this machine.
-        Err(_) => return,
+    let Some(cache) = gpu_cache() else {
+        return;
     };
     let lib = cache
         .shared_library(SharedLibUnit::Q4K)
@@ -190,9 +194,8 @@ fn an_mmq_gguf_unit_compiles_and_resolves() {
 /// scale layout. All three have to resolve out of the one compiled library.
 #[test]
 fn the_mmq_gguf_quantize_unit_exposes_all_three_layouts() {
-    let cache = match KernelCache::new(0) {
-        Ok(cache) => cache,
-        Err(_) => return,
+    let Some(cache) = gpu_cache() else {
+        return;
     };
     let lib = cache
         .shared_library(SharedLibUnit::Quantize)
@@ -216,9 +219,8 @@ fn the_mmq_gguf_quantize_unit_exposes_all_three_layouts() {
 /// library.
 #[test]
 fn distinct_mmq_gguf_units_do_not_shadow_each_other() {
-    let cache = match KernelCache::new(0) {
-        Ok(cache) => cache,
-        Err(_) => return,
+    let Some(cache) = gpu_cache() else {
+        return;
     };
     let q4k = cache
         .shared_library(SharedLibUnit::Q4K)
@@ -241,13 +243,70 @@ fn distinct_mmq_gguf_units_do_not_shadow_each_other() {
     }
 }
 
+/// `mmvq_gguf.cu` compiles to a shared library exposing every launcher
+/// `quantized::rocm::fast_mmvq` resolves: one per quant type and output
+/// dtype, plus one quantizer per activation dtype.
+#[test]
+fn the_mmvq_unit_exposes_every_launcher() {
+    let Some(cache) = gpu_cache() else {
+        return;
+    };
+    let lib = cache
+        .shared_library(SharedLibUnit::Mmvq)
+        .expect("mmvq_gguf unit failed to compile");
+    let tags = [
+        "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k",
+    ];
+    for act in ["f32", "f16", "bf16"] {
+        let mut symbols = vec![format!("launch_mmvq_gguf_quantize_q8_1_{act}\0")];
+        symbols.extend(
+            tags.iter()
+                .map(|tag| format!("launch_mmvq_gguf_{tag}_{act}_plain\0")),
+        );
+        for symbol in symbols {
+            // SAFETY: only resolving the symbol's address, not calling it.
+            unsafe {
+                lib.get::<unsafe extern "C" fn()>(symbol.as_bytes())
+                    .unwrap_or_else(|e| panic!("{symbol} not found: {e}"));
+            }
+        }
+    }
+}
+
+/// The MMVQ library and an MMQ one are separate units: neither lookup may
+/// be served by the other's library.
+#[test]
+fn the_mmvq_and_mmq_units_do_not_shadow_each_other() {
+    let Some(cache) = gpu_cache() else {
+        return;
+    };
+    let mmvq = cache
+        .shared_library(SharedLibUnit::Mmvq)
+        .expect("mmvq_gguf unit failed to compile");
+    let q4k = cache
+        .shared_library(SharedLibUnit::Q4K)
+        .expect("mmq_gguf Q4_K unit failed to compile");
+    // SAFETY: only resolving symbol addresses, not calling them.
+    unsafe {
+        assert!(
+            mmvq.get::<unsafe extern "C" fn()>(b"launch_mmq_gguf_q4_k\0")
+                .is_err(),
+            "MMQ's Q4_K launcher leaked into the MMVQ library"
+        );
+        assert!(
+            q4k.get::<unsafe extern "C" fn()>(b"launch_mmvq_gguf_q4_k_f32_plain\0")
+                .is_err(),
+            "MMVQ's Q4_K launcher leaked into the MMQ library"
+        );
+    }
+}
+
 /// The second call for the same unit is the in-memory hit: no recompile, no
 /// re-`dlopen`, same library instance.
 #[test]
 fn an_mmq_gguf_unit_is_cached_after_first_compile() {
-    let cache = match KernelCache::new(0) {
-        Ok(cache) => cache,
-        Err(_) => return,
+    let Some(cache) = gpu_cache() else {
+        return;
     };
     let first = cache
         .shared_library(SharedLibUnit::Q6K)

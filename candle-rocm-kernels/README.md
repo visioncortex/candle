@@ -125,6 +125,16 @@ version cannot read the bundle.
 Expect roughly 3–5 s per module on first use. `quantized.cu` is the outlier at
 about 70 s, being 4,845 lines.
 
+A few sources take a second pipeline: the `mmq_gguf/` kernels and
+`mmvq_gguf.cu`, which CUDA links statically. Their launchers are `extern "C"`
+host functions using `<<<>>>`, and `--genco` strips host code, so each one is
+built with `hipcc -shared -fPIC` into `{unit}_{key}.so` and opened with
+`dlopen` (`KernelCache::shared_library`, one `SharedLibUnit` per `.so`). Their
+headers are staged under `shared-lib-src-{headers_key}/`, and the key also
+covers each unit's own flag set. Older builds staged them under
+`mmq-gguf-src-*`, which nothing reads or removes any more; `make
+rocm-cache-clean` clears them.
+
 ## Kernels of your own
 
 A crate that depends on `candle-core` with `features = ["rocm"]` can put its own
