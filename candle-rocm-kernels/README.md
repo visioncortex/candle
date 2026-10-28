@@ -603,6 +603,9 @@ kept below with the fix noted, since the point is the report.
    `quantized.cu` now carries the full guard plus a clamp on the phantom row's
    load, `mmvq.rs::supports` no longer needs its parity fallback, and
    `odd_output_rows_stay_correct` covers the shapes it now serves.
+   `mmvq_gguf.cu`, CUDA's `fast_mmvq` kernel, had the store guard but not the
+   load clamp: its phantom row read up to a whole weight row past the buffer,
+   whose padding covers only 512 elements. It carries the same clamp now.
 4. **CPU `conv_transpose1d` is wrong for batch > 1.** `cpu_backend/mod.rs:1415`,
    `MatMul::f`, collapses the batch loop when `b_skip == 0 && a_skip == m * k`
    without checking that the lhs rows are contiguous. The col2im path of
