@@ -220,13 +220,15 @@ fn embedding_honours_the_ids_offset() -> Result<()> {
 
 /// `fwd`'s dense fallback dequantizes and defers to the rocBLAS GEMM; the
 /// result has to track the same computation run with the *same* dequantized
-/// weights, which is why the bound here is tight where the `q8_1` paths' own
-/// tests use a relative 2%.
+/// weights.
 ///
-/// Reaching that fallback at all takes a shape all three fused paths decline.
-/// `m` is past [`fast_mmvq::MAX_BATCH`], which rules out `mmvq_gguf` and DMMV;
-/// `Q2K` with `k = 256` then rules out MMQ, whose column loop steps 512
-/// elements at a time for that dtype. Q4K here would be claimed by MMQ.
+/// Reaching that fallback at all takes a dtype and shape every fused path
+/// declines. `m` is past [`fast_mmvq::MAX_BATCH`], which rules out
+/// `mmvq_gguf` and DMMV. `Q8K` has no `mul_mat_q*` kernel
+/// ([`mmq::kernel`]) and is absent from [`mmq_wmma::WMMA_DTYPES`], so it
+/// rules out both MMQ paths regardless of architecture. `Q2K` would not do
+/// that: `mmq_wmma` claims it on RDNA3/RDNA4, routing it through WMMA's
+/// `q8_1` re-quantization instead of this fallback.
 #[test]
 fn fwd_matches_a_dequantized_matmul() -> Result<()> {
     let dev = rocm_device!();
@@ -238,7 +240,7 @@ fn fwd_matches_a_dequantized_matmul() -> Result<()> {
     // `QTensor` stores the weights transposed, i.e. `(n, k)`.
     let rhs = Tensor::from_slice(&rhs, (n, k), &device)?;
 
-    let qt = crate::quantized::QTensor::quantize(&rhs, GgmlDType::Q2K)?;
+    let qt = crate::quantized::QTensor::quantize(&rhs, GgmlDType::Q8K)?;
     let want = lhs
         .matmul(&qt.dequantize(&device)?.t()?)?
         .to_vec2::<f32>()?;
@@ -246,9 +248,9 @@ fn fwd_matches_a_dequantized_matmul() -> Result<()> {
         .forward(&lhs)?
         .to_vec2::<f32>()?;
 
-    for (row_got, row_want) in got.iter().zip(want.iter()) {
-        for (a, b) in row_got.iter().zip(row_want.iter()) {
-            assert!((a - b).abs() <= 1e-3, "{a} vs {b}");
+    for (row_got, row_want) in got.iter().zip(&want) {
+        for (a, b) in row_got.iter().zip(row_want) {
+            assert!((a - b).abs() <= 1e-4 * b.abs().max(1.), "{a} vs {b}");
         }
     }
     Ok(())
