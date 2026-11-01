@@ -21,6 +21,11 @@
 //!
 //! The transposed row dips under 1.0 at three of six batches, so no threshold
 //! makes it safe. The reoriented row clears 1.0 from 256 up, peaking at 3.02x.
+//!
+//! All of the above is gfx1101 (RDNA3). On gfx1201 (RDNA4) the equivalent
+//! sweep (`bench_prefill::bench_dense_threshold_rdna4`) found this path losing
+//! to the real vector path everywhere from batch 128 to 8192, so
+//! [`preferred`] only takes it on RDNA3; see [`is_rdna3`].
 
 use super::QRocmStorage;
 use crate::backend::BackendStorage;
@@ -50,6 +55,20 @@ const MIN_BATCH: usize = 256;
 /// card runs, short of any vocabulary-sized matrix.
 const MAX_WEIGHTS: usize = 32 << 20;
 
+/// `true` once `cc` is a gfx11xx (RDNA3) value, the only generation this path
+/// has ever been measured to win on.
+///
+/// `MIN_BATCH` and the ratios above it come from gfx1101. On gfx1201 (RDNA4)
+/// `bench_dense_threshold_rdna4` found the opposite at every shape and batch
+/// from 128 to 8192: the real vector path (WMMA there) beat this one by
+/// 1.5x-9x, with no crossover to raise the threshold to. Rather than guess at
+/// a second threshold for a generation where this path has no measured win,
+/// it stays off outside the range it was tuned on.
+pub(super) fn is_rdna3(cc: Option<i32>) -> bool {
+    const OFFSET_AMD: i32 = 0x0100_0000;
+    matches!(cc, Some(cc) if (OFFSET_AMD + 0x1100..OFFSET_AMD + 0x1200).contains(&cc))
+}
+
 /// Whether [`forward`] is the *preferred* path rather than the last resort,
 /// which decides both that [`QRocmStorage::fwd`] skips MMQ and that the weights
 /// are worth reorienting.
@@ -57,11 +76,19 @@ const MAX_WEIGHTS: usize = 32 << 20;
 /// f32 is excluded: its GEMM peak is half f16's and its dequantize moves twice
 /// the bytes, so MMQ stayed ahead at every shape measured. bf16 has no
 /// dequantize kernel of its own and would pay those same two passes via f32.
-pub(super) fn preferred(act: DType, dtype: GgmlDType, n: usize, k: usize, b_size: usize) -> bool {
+pub(super) fn preferred(
+    act: DType,
+    dtype: GgmlDType,
+    n: usize,
+    k: usize,
+    b_size: usize,
+    cc: Option<i32>,
+) -> bool {
     act == DType::F16
         && b_size >= MIN_BATCH
         && n * k <= MAX_WEIGHTS
         && super::kernels::has_dequantize_kernel(dtype)
+        && is_rdna3(cc)
 }
 
 /// `(rows, cols)` contiguous in, `(cols, rows)` contiguous out.
@@ -111,7 +138,7 @@ pub(super) fn forward(
     // As a fallback it keeps the stride swap: the transpose is a fixed cost the
     // small batches here do not amortise, and these are the dtypes the sweep
     // never covered.
-    if preferred(storage.dtype(), q.dtype, n, k, b * m) {
+    if preferred(storage.dtype(), q.dtype, n, k, b * m, q.device.amd_cc()) {
         let weights = transposed(&weights, n, k)?;
         let rhs_l = Layout::contiguous(Shape::from((k, n))).broadcast_as((b, k, n))?;
         return storage.matmul(&weights, (b, m, n, k), layout, &rhs_l);

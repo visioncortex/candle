@@ -18,8 +18,9 @@
 //!   smallest size ever measured; see `mmq::min_work`.
 //! * [`dense`] — dequantize-then-GEMM, for everything left. Correct for every
 //!   dtype, but materialises the whole weight matrix in the activation's
-//!   dtype. At a prefill-sized batch of f16 it is also the *fastest* path, and
-//!   `dense::preferred` takes it ahead of MMQ.
+//!   dtype. At a prefill-sized batch of f16 on RDNA3 it is also the *fastest*
+//!   path, and `dense::preferred` takes it ahead of MMQ there; elsewhere it is
+//!   purely the fallback.
 //!
 //! `CANDLE_ROCM_FORCE_DMMV=1` disables both `q8_1` paths, leaving DMMV and the
 //! dense dequantize.
@@ -354,9 +355,16 @@ impl QRocmStorage {
         // MMQ: everything the vector paths declined, prefill above all. It
         // reads the packed weights directly, so the dense fallback below it is
         // otherwise only for the dtypes and shapes it has no kernel for — but
-        // at a prefill-sized batch of f16 the dense path is about twice as
-        // fast, and `dense::preferred` hands those to it instead.
-        if !dense::preferred(storage.dtype(), self.dtype, n, k, b_size) {
+        // at a prefill-sized batch of f16 on RDNA3 the dense path is about
+        // twice as fast, and `dense::preferred` hands those to it instead.
+        if !dense::preferred(
+            storage.dtype(),
+            self.dtype,
+            n,
+            k,
+            b_size,
+            self.device.amd_cc(),
+        ) {
             // RDNA3/RDNA4 WMMA matrix cores beat `__dp4a` outright where both
             // are available (Q4_K/Q6_K only for now; see `mmq_wmma::unit`),
             // so it is tried first and `mmq` is the fallback for every other

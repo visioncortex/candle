@@ -135,3 +135,101 @@ fn bench_prefill_roofline() -> Result<()> {
     }
     Ok(())
 }
+
+/// [`bench_prefill_roofline`]'s comparison redone for RDNA4: the real `fwd()`
+/// competitor — WMMA where [`super::mmq_wmma`] covers the dtype, `dp4a`
+/// otherwise — against [`super::dense::forward`], for f16 activations, over a
+/// wider batch sweep (128 to 8192) and a llama-shaped 4096x4096/4096x32000
+/// pair in addition to Qwen3.5-2B's shapes. `best_ms` is whichever vector path
+/// wins; `v_best` above 1.0 would mean dense wins.
+///
+/// On gfx1201 it never does: `v_best` ranges 0.11-0.65 over every dtype,
+/// shape and batch here, i.e. dense is 1.5x-9x slower than the real dispatch
+/// at every point measured, not faster as it is on gfx1101 — see
+/// `dense::is_rdna3`, which this justifies.
+#[test]
+#[ignore = "benchmark: needs a GPU and takes seconds"]
+fn bench_dense_threshold_rdna4() -> Result<()> {
+    let device = rocm_device!();
+    let dev = match &device {
+        Device::Rocm(dev) => dev.clone(),
+        _ => return Ok(()),
+    };
+    println!("has_wmma: {}, amd_cc: {:?}", dev.has_wmma(), dev.amd_cc());
+    println!(
+        "{:>6} {:>7} {:>6} {:>6} {:>9} {:>9} {:>9} {:>7}",
+        "dtype", "k", "n", "m", "best_ms", "nn_ms", "kind", "v_best"
+    );
+    let shapes = [
+        (2048usize, 2048usize),
+        (2048, 8192),
+        (8192, 2048),
+        (4096, 4096),
+        (4096, 32000),
+    ];
+    for dtype in [
+        GgmlDType::Q8_0,
+        GgmlDType::Q4_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q6K,
+    ] {
+        for (k, n) in shapes {
+            if !k.is_multiple_of(dtype.block_size()) {
+                continue;
+            }
+            let rhs = Tensor::rand(-1f32, 1f32, (n, k), &device)?;
+            let qt = QTensor::quantize(&rhs, dtype)?;
+            let q = match &qt.storage {
+                crate::quantized::QStorage::Rocm(q) => q,
+                _ => return Ok(()),
+            };
+            for m in [128usize, 256, 512, 1024, 2048, 4096, 8192] {
+                let lhs: Vec<f32> = (0..m * k).map(|i| (i as f32 / 53.).sin()).collect();
+                let y = dev.clone_htod(&lhs)?;
+                let lhs16 = Tensor::from_slice(&lhs, (m, k), &device)?.to_dtype(DType::F16)?;
+                let (act, act_l) = lhs16.storage_and_layout();
+                let act = match &*act {
+                    crate::Storage::Rocm(s) => s,
+                    _ => return Ok(()),
+                };
+                let (mut best, mut nn) = (vec![], vec![]);
+                let kind = if dev.has_wmma() && super::mmq_wmma::unit(dtype).is_some() {
+                    "wmma"
+                } else {
+                    "dp4a"
+                };
+                let iters = if m > 2048 { 5 } else { 20 };
+                for _ in 0..REPS {
+                    best.push(time(&device, iters, || {
+                        if let Some(unit) = super::mmq_wmma::unit(dtype) {
+                            if dev.has_wmma() {
+                                return super::mmq_wmma::mul_mat_via_q8_1_mmq(
+                                    &q.data, q.len, &y, 0, dtype, unit, k, n, m, &dev,
+                                )
+                                .map(|_| ());
+                            }
+                        }
+                        super::mmq::mul_mat_via_q8_1(&q.data, q.len, &y, 0, dtype, k, n, m, &dev)
+                            .map(|_| ())
+                    })?);
+                    nn.push(time(&device, iters, || {
+                        super::dense::forward(q, (1, m, n, k), act, act_l).map(|_| ())
+                    })?);
+                }
+                let (best_ms, nn_ms) = (median(&mut best), median(&mut nn));
+                println!(
+                    "{:>6} {:>7} {:>6} {:>6} {:>9.4} {:>9.4} {:>9} {:>7.2}",
+                    format!("{dtype:?}"),
+                    k,
+                    n,
+                    m,
+                    best_ms,
+                    nn_ms,
+                    kind,
+                    best_ms / nn_ms,
+                );
+            }
+        }
+    }
+    Ok(())
+}
