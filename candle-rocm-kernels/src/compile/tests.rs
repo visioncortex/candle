@@ -99,6 +99,39 @@ fn a_revised_source_is_not_shadowed_by_the_name_it_reuses() {
         .expect("the first revision was evicted");
 }
 
+/// The fast path keys on a `'static` source's address: a repeat call with
+/// the exact same reference and name must hit it and resolve the same
+/// module, not fail or compile a second copy.
+#[test]
+fn a_static_source_is_recognised_by_address() {
+    let Some(cache) = gpu_cache() else {
+        return;
+    };
+    let first = cache
+        .get_or_load_custom_static("candle_rocm_kernels_static", CUSTOM)
+        .expect("static source failed to compile");
+    let second = cache
+        .get_or_load_custom_static("candle_rocm_kernels_static", CUSTOM)
+        .expect("static source failed to resolve from the fast path");
+    assert!(Arc::ptr_eq(&first, &second));
+}
+
+/// The fast path's key is the source's address alone, not `module_name`.
+/// Reusing a `'static` source under a second name would otherwise silently
+/// resolve to the first call's name; that must be rejected instead.
+#[test]
+fn a_static_source_rejects_reuse_under_a_different_name() {
+    let Some(cache) = gpu_cache() else {
+        return;
+    };
+    cache
+        .get_or_load_custom_static("candle_rocm_kernels_static_a", CUSTOM)
+        .expect("static source failed to compile");
+    assert!(cache
+        .get_or_load_custom_static("candle_rocm_kernels_static_b", CUSTOM)
+        .is_err());
+}
+
 /// Custom modules live in their own namespace. Keying both kinds by a bare
 /// string would hand a downstream crate that named its module `unary`
 /// candle's `unary` instead — a wrong-kernel launch, not an error.

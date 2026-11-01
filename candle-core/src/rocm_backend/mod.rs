@@ -72,7 +72,7 @@ mod tests_sort;
 mod tests_transpose;
 mod wrappers;
 pub use alloc::{GraphCaptureSession, PinnedBuffer, SendSyncDeviceMemory, VmmPool, VmmSlice};
-pub use device::{DeviceId, RocmDevice};
+pub use device::{DeviceId, RocmDevice, RocmModule};
 pub use error::{RocmError, WrapErr};
 pub use gemm_precision::{
     gemm_reduced_precision_bf16, gemm_reduced_precision_f16, gemm_reduced_precision_f32,

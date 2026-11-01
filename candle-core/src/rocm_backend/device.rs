@@ -1,5 +1,5 @@
 use crate::Result;
-use candle_rocm_kernels::KernelCache;
+use candle_rocm_kernels::{KernelCache, KernelError, SendSyncModule};
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::alloc::{
@@ -380,6 +380,18 @@ impl RocmDevice {
     /// keep the returned function rather than ask for it again: the handle
     /// borrows nothing and modules are never unloaded, which is also why every
     /// distinct source stays resident for the life of the process.
+    ///
+    /// ```no_run
+    /// # use candle_core::rocm_backend::RocmDevice;
+    /// # fn launch(dev: &RocmDevice) -> candle_core::Result<()> {
+    /// const SOURCE: &str = "extern \"C\" __global__ void my_kernel() {}";
+    /// let func = dev.get_or_load_custom_func("my_kernel", "my_module", SOURCE)?;
+    /// // Hold `func` across repeat launches instead of calling this again:
+    /// // each call re-hashes SOURCE to form its cache key, even on a hit.
+    /// # let _ = func;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn get_or_load_custom_func(
         &self,
         kernel_name: &str,
@@ -389,6 +401,98 @@ impl RocmDevice {
         self.bind()?;
         self.kernel_manager
             .custom_function(module_name, source, kernel_name)
+            .w()
+    }
+
+    /// [`Self::get_or_load_custom_func`], but returns the module instead of
+    /// resolving one kernel in it, and takes a `source` the caller holds for
+    /// the life of the process (a `const`, a leaked `String`, a
+    /// `OnceLock`'s contents).
+    ///
+    /// Safe and fast to call on every launch with the same `source`
+    /// reference: see [`KernelCache::get_or_load_custom_static`]'s doc
+    /// comment for why a repeat call recognises it by address and skips the
+    /// SHA-256 pass `get_or_load_custom_func` repeats on every call to form
+    /// its cache key. Holding the returned [`RocmModule`] across launches
+    /// into the same translation unit saves the lookup itself too, worth
+    /// doing when convenient, but no longer required for the hash to be
+    /// paid once rather than per launch.
+    ///
+    /// Reach for this over [`Self::get_or_load_custom_func`] when a launch
+    /// needs more than one kernel out of the same module, e.g. a kernel and
+    /// a fixup pass that merges its partial results:
+    ///
+    /// ```no_run
+    /// # use candle_core::rocm_backend::RocmDevice;
+    /// use std::sync::OnceLock;
+    ///
+    /// # fn launch(dev: &RocmDevice) -> candle_core::Result<()> {
+    /// static SOURCE: OnceLock<String> = OnceLock::new();
+    /// let source: &'static str =
+    ///     SOURCE.get_or_init(|| "extern \"C\" __global__ void k() {}".to_string());
+    ///
+    /// // Safe and fast to call on every launch: a repeat call with this
+    /// // exact `source` reference is recognised by address, not re-hashed.
+    /// let module = dev.get_or_load_custom_module("my_module", source)?;
+    /// let main_kernel = module.function("k")?;
+    /// // let fixup_kernel = module.function("k_fixup")?;
+    /// # let _ = main_kernel;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_or_load_custom_module(
+        &self,
+        module_name: &str,
+        source: &'static str,
+    ) -> crate::Result<RocmModule> {
+        self.bind()?;
+        let device = self.clone();
+        self.kernel_manager
+            .get_or_load_custom_static(module_name, source)
+            .map(|inner| RocmModule {
+                device,
+                module_name: module_name.to_string(),
+                inner,
+            })
+            .w()
+    }
+}
+
+/// A compiled custom-kernel module, resolved once via
+/// [`RocmDevice::get_or_load_custom_module`].
+///
+/// Holds the device that loaded it so [`Self::function`] can bind
+/// it before resolving a kernel, matching every sibling path
+/// (`get_or_load_func`, `get_or_load_custom_func`): HIP's current
+/// device is thread-local, so a `RocmModule` held across work that
+/// switches the calling thread to another GPU would otherwise
+/// dispatch to the wrong device. Cheap to clone and hold across
+/// many launches: `RocmDevice` is entirely `Arc`-backed, and
+/// translation units are never unloaded.
+#[derive(Clone)]
+pub struct RocmModule {
+    device: RocmDevice,
+    module_name: String,
+    inner: Arc<SendSyncModule>,
+}
+
+impl RocmModule {
+    /// Resolve `name` inside this module.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the device cannot be made current, or
+    /// if `name` is not a kernel in this module.
+    pub fn function(&self, name: &str) -> crate::Result<rocm_rs::hip::Function> {
+        self.device.bind()?;
+        self.inner
+            .get_function(name)
+            .map_err(|e| {
+                KernelError::Rocm(format!(
+                    "kernel `{name}` not found in module `{}`: {e}",
+                    self.module_name
+                ))
+            })
             .w()
     }
 }

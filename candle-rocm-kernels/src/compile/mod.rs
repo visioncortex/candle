@@ -103,6 +103,16 @@ pub struct KernelCache {
     /// Per-unit compile lock, the same role [`Self::compiling`] plays for
     /// `--genco` modules.
     shared_lib_compiling: Mutex<HashMap<SharedLibUnit, Arc<Mutex<()>>>>,
+    /// Fast path for [`Self::get_or_load_custom_static`], keyed by a
+    /// `&'static str` source's address and length rather than its content.
+    ///
+    /// Two different `'static` strings can never share an address, so this
+    /// is as safe as the content digest it lets a caller skip, for the
+    /// price of a pointer comparison instead of a hash of the whole source.
+    /// A non-`'static` source could have its backing memory freed and
+    /// reused at the same address by unrelated data, so this cache must
+    /// never be reachable from a caller that cannot promise `'static`.
+    static_source_cache: RwLock<HashMap<(usize, usize), ModuleName>>,
 }
 
 impl KernelCache {
@@ -129,6 +139,7 @@ impl KernelCache {
             compiling: Mutex::new(HashMap::new()),
             shared_libs: RwLock::new(HashMap::new()),
             shared_lib_compiling: Mutex::new(HashMap::new()),
+            static_source_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -242,6 +253,60 @@ impl KernelCache {
             },
             source,
         )
+    }
+
+    /// [`Self::get_or_load_custom`], but for a source a caller holds for the
+    /// life of the process (a `const`, a leaked `String`, a `OnceLock`'s
+    /// contents). Skips the SHA-256 pass on every call after the first: a
+    /// repeat call with the exact same `source` reference is recognised by
+    /// its address, and only a genuinely new source pays the hash.
+    ///
+    /// Requiring `'static` is what makes this sound: a non-`'static`
+    /// `source`'s backing memory could be freed and a later allocation reuse
+    /// the same address for unrelated content, which this cache has no way
+    /// to detect. A caller that cannot promise `'static` must use
+    /// [`Self::get_or_load_custom`] instead.
+    ///
+    /// The fast-path key is the source's address alone, not `module_name`, so
+    /// reusing the same `'static` source under a second name is a caller bug:
+    /// it would otherwise silently resolve to the first call's name on disk
+    /// and in error messages. That is rejected with [`KernelError::Internal`]
+    /// rather than honoured, on both a cache hit and the losing side of a
+    /// first-insert race.
+    pub fn get_or_load_custom_static(
+        &self,
+        module_name: &str,
+        source: &'static str,
+    ) -> Result<Arc<SendSyncModule>, KernelError> {
+        let key = (source.as_ptr() as usize, source.len());
+        let cached = {
+            let fast = self.static_source_cache.read().map_err(|_| {
+                KernelError::Internal("static source cache lock is poisoned".to_string())
+            })?;
+            fast.get(&key).cloned()
+        };
+        let name = match cached {
+            Some(name) => name,
+            None => {
+                let name = ModuleName::Custom {
+                    name: module_name.to_string(),
+                    source: cache::source_digest(source),
+                };
+                let mut fast = self.static_source_cache.write().map_err(|_| {
+                    KernelError::Internal("static source cache lock is poisoned".to_string())
+                })?;
+                // Someone may have raced us to the write lock with this same
+                // source; take whichever name landed, not this thread's.
+                fast.entry(key).or_insert(name).clone()
+            },
+        };
+        if name.as_str() != module_name {
+            return Err(KernelError::Internal(format!(
+                "static source already registered as module `{}`, cannot reuse it for `{module_name}`",
+                name.as_str()
+            )));
+        }
+        self.load(name, source)
     }
 
     fn load(&self, name: ModuleName, source: &str) -> Result<Arc<SendSyncModule>, KernelError> {
