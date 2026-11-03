@@ -22,6 +22,17 @@ macro_rules! device {
     };
 }
 
+/// Skip when the runtime cannot back a VMM reservation (`hipMemCreate` is
+/// `hipErrorNotSupported` on APUs such as gfx1151), the same way `device!`
+/// skips when there is no GPU at all.
+macro_rules! vmm_or_skip {
+    () => {
+        if !super::alloc::vmm_usable(0) {
+            return Ok(());
+        }
+    };
+}
+
 /// A dropped buffer must come back rather than go to the driver — that is
 /// the whole reason this allocator exists.
 #[test]
@@ -188,6 +199,7 @@ fn sync_then_drop_pinned_buffer_is_safe() -> Result<()> {
 #[test]
 fn vmm_pool_allocs_return_stable_addresses() -> Result<()> {
     let _dev = device!();
+    vmm_or_skip!();
     let pool = VmmPool::new(0).w()?;
     let sizes = [64usize, 256, 1024, 4096];
 
@@ -213,6 +225,7 @@ fn vmm_pool_allocs_return_stable_addresses() -> Result<()> {
 #[test]
 fn vmm_pool_grows_past_initial_mapping() -> Result<()> {
     let _dev = device!();
+    vmm_or_skip!();
     let pool = VmmPool::new(0).w()?;
 
     // Comfortably larger than any realistic HIP allocation granularity
@@ -231,6 +244,7 @@ fn vmm_pool_grows_past_initial_mapping() -> Result<()> {
 #[test]
 fn vmm_pool_reset_reclaims_space() -> Result<()> {
     let _dev = device!();
+    vmm_or_skip!();
     let pool = VmmPool::new(0).w()?;
 
     let _first = pool.alloc(1024).w()?;
@@ -251,6 +265,7 @@ fn vmm_pool_reset_reclaims_space() -> Result<()> {
 #[test]
 fn vmm_pool_drop_does_not_crash() -> Result<()> {
     let _dev = device!();
+    vmm_or_skip!();
     let pool = VmmPool::new(0).w()?;
     // Comfortably larger than any realistic HIP allocation granularity, so
     // each call forces its own grow and leaves its own entry in `mappings`.
@@ -265,6 +280,7 @@ fn vmm_pool_drop_does_not_crash() -> Result<()> {
 #[test]
 fn vmm_pool_write_readback_round_trips() -> Result<()> {
     let _dev = device!();
+    vmm_or_skip!();
     let pool = VmmPool::new(0).w()?;
     let data: Vec<u8> = (0..4096u32).map(|i| (i % 256) as u8).collect();
 
@@ -305,6 +321,7 @@ fn vmm_pool_write_readback_round_trips() -> Result<()> {
 #[test]
 fn capture_mode_routes_allocs_through_vmm_pool() -> Result<()> {
     let dev = device!();
+    vmm_or_skip!();
     let pool = Arc::new(VmmPool::new(0).w()?);
 
     // Outside the session: ordinary bucketed reuse.
@@ -342,6 +359,7 @@ fn capture_mode_routes_allocs_through_vmm_pool() -> Result<()> {
 #[test]
 fn capture_mode_allocs_are_not_recycled() -> Result<()> {
     let dev = device!();
+    vmm_or_skip!();
     let pool = Arc::new(VmmPool::new(0).w()?);
     let before = dev.allocator.cached_bytes();
 
@@ -361,6 +379,7 @@ fn capture_mode_allocs_are_not_recycled() -> Result<()> {
 #[test]
 fn begin_graph_capture_rejects_nested_capture() -> Result<()> {
     let dev = device!();
+    vmm_or_skip!();
     let pool = Arc::new(VmmPool::new(0).w()?);
 
     let _outer = dev.begin_graph_capture(pool.clone())?;
@@ -377,6 +396,7 @@ fn begin_graph_capture_rejects_nested_capture() -> Result<()> {
 #[test]
 fn begin_graph_capture_rejects_concurrent_capture() -> Result<()> {
     let dev = device!();
+    vmm_or_skip!();
     let pool = Arc::new(VmmPool::new(0).w()?);
     let start = Arc::new(Barrier::new(2));
     let done = Arc::new(Barrier::new(2));
@@ -416,6 +436,7 @@ fn begin_graph_capture_rejects_concurrent_capture() -> Result<()> {
 #[test]
 fn graph_capture_session_rolls_back_pool_on_abandoned_capture() -> Result<()> {
     let dev = device!();
+    vmm_or_skip!();
     let pool = Arc::new(VmmPool::new(0).w()?);
     let mark = pool.watermark();
 
@@ -436,6 +457,7 @@ fn graph_capture_session_rolls_back_pool_on_abandoned_capture() -> Result<()> {
 #[test]
 fn graph_capture_session_keeps_watermark_after_successful_end() -> Result<()> {
     let dev = device!();
+    vmm_or_skip!();
     let pool = Arc::new(VmmPool::new(0).w()?);
     let mark = pool.watermark();
 
@@ -458,7 +480,7 @@ fn graph_capture_session_keeps_watermark_after_successful_end() -> Result<()> {
 #[cfg(debug_assertions)]
 #[should_panic(expected = "VmmSlice used after pool reset")]
 fn vmm_slice_panics_on_stale_use() {
-    if RocmDevice::new(0).is_err() {
+    if RocmDevice::new(0).is_err() || !super::alloc::vmm_usable(0) {
         panic!("VmmSlice used after pool reset");
     }
     let pool = VmmPool::new(0).unwrap();

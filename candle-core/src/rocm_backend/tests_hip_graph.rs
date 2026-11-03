@@ -292,6 +292,11 @@ fn concurrent_graph_plan_style_captures_do_not_corrupt_each_other() -> Result<()
     const ROUNDS: usize = 20;
     const THREADS: usize = 8;
 
+    // Graph-plan captures allocate from a VMM pool; skip where VMM is unsupported.
+    if !super::alloc::vmm_usable(0) {
+        return Ok(());
+    }
+
     fn matmul_chain(a: &Tensor, w1: &Tensor, w2: &Tensor) -> Result<Tensor> {
         a.matmul(w1)?.matmul(w2)
     }
