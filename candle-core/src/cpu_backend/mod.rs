@@ -514,25 +514,36 @@ impl Map1 for UpsampleNearest2D {
         let src_index = layout.start_offset();
         let scale_h = src_h as f64 / dst_h as f64;
         let scale_w = src_w as f64 / dst_w as f64;
-        let mut dst = vec![T::zero(); b_sz * c * dst_h * dst_w];
+        let plane = dst_h * dst_w;
+        let mut dst = vec![T::zero(); b_sz * c * plane];
+        if plane == 0 || c == 0 {
+            return Ok(dst);
+        }
         let src_h_idxs = (0..dst_h)
             .map(|h_idx| usize::min(src_h - 1, (h_idx as f64 * scale_h) as usize))
             .collect::<Vec<_>>();
         let src_w_idxs = (0..dst_w)
             .map(|w_idx| usize::min(src_w - 1, (w_idx as f64 * scale_w) as usize))
             .collect::<Vec<_>>();
-        for b_idx in 0..b_sz {
-            let dst = &mut dst[b_idx * c * dst_h * dst_w..];
-            let src_index = src_index + b_idx * stride[0];
-            for c_idx in 0..c {
-                let dst = &mut dst[c_idx * dst_h * dst_w..];
-                let src_index = src_index + c_idx * stride[1];
-                for (h_idx, src_h_idx) in src_h_idxs.iter().enumerate() {
-                    for (w_idx, src_w_idx) in src_w_idxs.iter().enumerate() {
-                        let src_index = src_index + src_h_idx * stride_h + src_w_idx * stride_w;
-                        dst[h_idx * dst_w + w_idx] = src[src_index]
-                    }
+        // One (batch, channel) plane per task; large images fan out over rayon.
+        let fill = |bc: usize, dst: &mut [T]| {
+            let (b_idx, c_idx) = (bc / c, bc % c);
+            let src_index = src_index + b_idx * stride[0] + c_idx * stride[1];
+            for (h_idx, src_h_idx) in src_h_idxs.iter().enumerate() {
+                let row = &mut dst[h_idx * dst_w..(h_idx + 1) * dst_w];
+                let src_row = src_index + src_h_idx * stride_h;
+                for (d, src_w_idx) in row.iter_mut().zip(src_w_idxs.iter()) {
+                    *d = src[src_row + src_w_idx * stride_w]
                 }
+            }
+        };
+        if b_sz * c * plane >= PAR_COPY_MIN_ELEMS {
+            dst.par_chunks_mut(plane)
+                .enumerate()
+                .for_each(|(bc, p)| fill(bc, p));
+        } else {
+            for (bc, p) in dst.chunks_mut(plane).enumerate() {
+                fill(bc, p)
             }
         }
         Ok(dst)
@@ -945,8 +956,12 @@ impl<I: IntDType> Map2 for IndexAdd<'_, I> {
     }
 }
 
+/// Elements below which a copy stays on the calling thread: the rayon
+/// hand-off costs more than copying a few hundred KB does.
+const PAR_COPY_MIN_ELEMS: usize = 1 << 18;
+
 #[allow(clippy::too_many_arguments)]
-fn copy2d_<T: Copy>(
+fn copy2d_<T: Copy + Send + Sync>(
     src: &[T],
     dst: &mut [T],
     d1: usize,
@@ -963,6 +978,20 @@ fn copy2d_<T: Copy>(
         dst[dst_start..dst_start + d1 * d2].copy_from_slice(&src[src_start..src_start + d1 * d2]);
         return;
     }
+    // Large row copies (cat, narrow, pad of a big image) fan out over rayon:
+    // each task owns one destination row, so the result is the serial one.
+    if d1 > 1 && dst_stride1 >= d2 && d1 * d2 >= PAR_COPY_MIN_ELEMS {
+        let src = &src[src_offset..];
+        let dst = &mut dst[dst_offset..];
+        dst.par_chunks_mut(dst_stride1)
+            .take(d1)
+            .enumerate()
+            .for_each(|(i, row)| {
+                let s = i * src_stride1;
+                row[..d2].copy_from_slice(&src[s..s + d2]);
+            });
+        return;
+    }
     let mut src_idx = src_offset;
     let mut dst_idx = dst_offset;
     for _ in 0..d1 {
@@ -972,7 +1001,77 @@ fn copy2d_<T: Copy>(
     }
 }
 
-fn copy_strided_src_<T: Copy>(src: &[T], dst: &mut [T], dst_offset: usize, src_l: &Layout) {
+/// Smallest count `k` of leading dims whose product reaches `want` while the
+/// trailing dims still hold at least a few hundred elements, so a strided
+/// copy can be split into `prod(dims[..k])` independent sub-copies. None when
+/// the shape has no such split (too small, or one giant trailing dim).
+fn split_leading_dims(dims: &[usize], want: usize) -> Option<usize> {
+    let mut outer = 1usize;
+    for k in 1..dims.len() {
+        outer *= dims[k - 1];
+        let inner: usize = dims[k..].iter().product();
+        if inner < 256 {
+            return None;
+        }
+        if outer >= want {
+            return Some(k);
+        }
+    }
+    None
+}
+
+/// Strided-source copy, fanned out over rayon when the source is large and
+/// not a single memcpy: a transposed or narrowed view of a 4k-edge f32 image
+/// is a hundred-MB cache-hostile gather, and one core at a few GB/s was the
+/// bottleneck of whole-image inference on the CPU (vtracer, 2026-11-04). The
+/// layout's leading dims are split into independent sub-layouts, each walked
+/// serially into its own disjoint destination chunk, so the bytes written are
+/// exactly those of the serial walk.
+fn copy_strided_src_<T: Copy + Send + Sync>(
+    src: &[T],
+    dst: &mut [T],
+    dst_offset: usize,
+    src_l: &Layout,
+) {
+    let n = src_l.shape().elem_count();
+    if n >= PAR_COPY_MIN_ELEMS
+        && !matches!(
+            src_l.strided_blocks(),
+            crate::StridedBlocks::SingleBlock { .. }
+        )
+    {
+        let dims = src_l.dims();
+        let stride = src_l.stride();
+        if let Some(k) = split_leading_dims(dims, 2 * crate::utils::get_num_threads()) {
+            let inner: usize = dims[k..].iter().product();
+            let inner_shape = Shape::from(dims[k..].to_vec());
+            let inner_stride = stride[k..].to_vec();
+            let dst = &mut dst[dst_offset..dst_offset + n];
+            dst.par_chunks_mut(inner)
+                .enumerate()
+                .for_each(|(o, chunk)| {
+                    // Decompose the chunk index over the leading dims, row-major.
+                    let mut rem = o;
+                    let mut offset = src_l.start_offset();
+                    for d in (0..k).rev() {
+                        offset += (rem % dims[d]) * stride[d];
+                        rem /= dims[d];
+                    }
+                    let l = Layout::new(inner_shape.clone(), inner_stride.clone(), offset);
+                    copy_strided_src_serial(src, chunk, 0, &l);
+                });
+            return;
+        }
+    }
+    copy_strided_src_serial(src, dst, dst_offset, src_l)
+}
+
+fn copy_strided_src_serial<T: Copy + Send + Sync>(
+    src: &[T],
+    dst: &mut [T],
+    dst_offset: usize,
+    src_l: &Layout,
+) {
     match src_l.strided_blocks() {
         crate::StridedBlocks::SingleBlock { start_offset, len } => dst
             [dst_offset..dst_offset + len]

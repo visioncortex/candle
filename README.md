@@ -1,4 +1,62 @@
 # candle
+
+> **This is the visioncortex fork** — upstream candle at 0.11.0
+> (`2cf0e66d`) plus the fixes and the ROCm backend listed below, published
+> as 0.11.1 on branch `main`. The public API is upstream's; every change is
+> a fix, a backend or a performance path behind it. The list is kept in
+> order of the layers as they sit on upstream.
+
+## Notable fixes in this fork
+
+**CPU**
+- Large copies run on all cores. `copy2d` (cat, narrow, pad), strided-source
+  copies (transpose, pixel shuffle, `contiguous()` of a view), nearest
+  upsample and the NCHW→NHWC transpose inside the tiled conv2d were serial
+  loops; whole-image CNN inference on a 4k-edge raster ran on one core with
+  the rayon pool idle (16 threads bought 2.2× over one). They fan out over
+  rayon above 256k elements with byte-identical results; the 1×1 conv's
+  input reshape likewise.
+- conv1d with a strided kernel view matmul'd the original buffer at its old
+  offset (the cpu conv2d fix of #3736 had not reached conv1d).
+
+**Metal (Apple Silicon)**
+- `MetalDevice::new` panicked on M-series: the system default device is used.
+- The conv weight-gradient was wrong through a non-contiguous im2col and
+  training diverged; the gradient's inputs are made contiguous.
+- Errored in-flight command buffers are surfaced from
+  `flush_and_wait_current` instead of their output being read as garbage.
+- Wired-memory growth from the buffer pool is bounded, the pool sweep is
+  non-blocking (it could self-deadlock), and the residency set is skipped
+  where the class is missing.
+- conv1d/conv2d with a non-contiguous kernel view used the original buffer
+  at its old start offset; `index_select` bailed on strided ids where
+  CPU/CUDA accept them; a zero-length buffer came back nil from
+  `newBufferWithBytes`.
+
+**CUDA**
+- cudarc dynamic loading probes the CUDA DLLs at runtime: a plain-cuda
+  binary degrades to CPU instead of failing to start on a machine without
+  the driver.
+
+**ROCm — a new backend, `--features rocm`**
+- `candle-core/src/rocm_backend` and the `candle-rocm-kernels` crate: the
+  HIP backend begun in upstream #3424, continued in cryptomilk/candle-rocm
+  and rebased here (lineage in `candle-rocm-kernels/README.md`). The shared
+  `candle-kernels` CUDA sources are compiled under HIP through a header
+  shim, so nothing drifts from the CUDA kernels.
+- Convolutions through MIOpen, pooling, upsample, gather/scatter/index_add,
+  cmp/where, arg_sort, RNG, rotary embeddings, softmax/norms; F8E4M3 and
+  bf16 arithmetic; quantized GGUF tensors with AMD WMMA MMQ/MMVQ matmul
+  paths retuned for RDNA geometry, imatrix quantization and the quantized
+  MoE forward.
+- A VMM pool for address-stable allocations under HIP graph capture/replay,
+  host↔device copies off the legacy stream, async host-to-device, a bounded
+  allocator cache so shape-drifting decode cannot hoard VRAM
+  (`CANDLE_ROCM_CACHE_LIMIT_MB`), the materialized im2col buffer capped at
+  256 MB through chunked kernels.
+- Tests needing `hipMemCreate` skip on APUs that lack it (gfx1151, Strix
+  Halo), so the suite runs on integrated parts as well as discrete cards.
+
 [![discord server](https://dcbadge.limes.pink/api/server/hugging-face-879548962464493619)](https://discord.gg/hugging-face-879548962464493619)
 [![Latest version](https://img.shields.io/crates/v/candle-core.svg)](https://crates.io/crates/candle-core)
 [![Documentation](https://docs.rs/candle-core/badge.svg)](https://docs.rs/candle-core)

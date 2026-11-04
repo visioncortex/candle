@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::prelude::*;
 
 use crate::{
     conv::ParamsConv2D,
@@ -89,16 +89,24 @@ fn conv2d_1x1<T: WithDType + num_traits::Num + Copy + 'static>(
 
     // Process each batch
     (0..p.b_size).into_par_iter().try_for_each(|b_idx| {
-        // Reshape input to [c_in, h*w] for this batch
-        let mut inp_reshaped = Vec::with_capacity(p.c_in * spatial_size);
-        for c_in_idx in 0..p.c_in {
-            for h_idx in 0..p.i_h {
-                for w_idx in 0..p.i_w {
-                    let inp_idx =
-                        b_idx * inp_s0 + c_in_idx * inp_s1 + h_idx * inp_s2 + w_idx * inp_s3;
-                    inp_reshaped.push(inp[inp_idx]);
-                }
-            }
+        // Reshape input to [c_in, h*w] for this batch, one channel plane per
+        // rayon task (the batch loop above is parallel too, but inference
+        // batches are usually 1).
+        let mut inp_reshaped = vec![T::zero(); p.c_in * spatial_size];
+        if spatial_size > 0 {
+            inp_reshaped
+                .par_chunks_mut(spatial_size)
+                .enumerate()
+                .for_each(|(c_in_idx, plane)| {
+                    let base = b_idx * inp_s0 + c_in_idx * inp_s1;
+                    for h_idx in 0..p.i_h {
+                        let src = base + h_idx * inp_s2;
+                        let row = &mut plane[h_idx * p.i_w..(h_idx + 1) * p.i_w];
+                        for (w_idx, d) in row.iter_mut().enumerate() {
+                            *d = inp[src + w_idx * inp_s3];
+                        }
+                    }
+                });
         }
         let inp_layout = Layout::contiguous((p.c_in, spatial_size));
 
@@ -143,17 +151,27 @@ fn conv2d_tiled<T: WithDType + num_traits::Num + Copy + 'static>(
     let cont_s0 = p.i_h * p.i_w * p.c_in;
     let cont_s1 = p.i_w * p.c_in;
     let cont_s2 = p.c_in;
+    // One destination row (all w, all c) per rayon task; inside a row the
+    // channel loop is outermost so the source reads run along w (contiguous
+    // for NCHW) and the strided writes land in a row that fits the cache.
+    // Serial, this transpose was the single-thread bottleneck of large
+    // convolutions: a 105 MB cache-hostile gather per conv call.
     let mut inp_cont = vec![T::zero(); p.b_size * p.c_in * p.i_h * p.i_w];
-    for b_idx in 0..p.b_size {
-        for h_idx in 0..p.i_h {
-            for w_idx in 0..p.i_w {
+    debug_assert_eq!(cont_s0, p.i_h * cont_s1);
+    if cont_s1 > 0 {
+        inp_cont
+            .par_chunks_mut(cont_s1)
+            .enumerate()
+            .for_each(|(row, dst_row)| {
+                let (b_idx, h_idx) = (row / p.i_h, row % p.i_h);
+                let src_row = b_idx * inp_s0 + h_idx * inp_s2;
                 for c_idx in 0..p.c_in {
-                    let src_idx = b_idx * inp_s0 + c_idx * inp_s1 + h_idx * inp_s2 + w_idx * inp_s3;
-                    let dst_idx = b_idx * cont_s0 + h_idx * cont_s1 + w_idx * cont_s2 + c_idx;
-                    inp_cont[dst_idx] = inp[src_idx]
+                    let src = src_row + c_idx * inp_s1;
+                    for w_idx in 0..p.i_w {
+                        dst_row[w_idx * cont_s2 + c_idx] = inp[src + w_idx * inp_s3];
+                    }
                 }
-            }
-        }
+            });
     }
 
     // shape of k: [c_out, c_in, k_h, k_w]
@@ -290,17 +308,27 @@ fn conv2d_direct<T: WithDType + num_traits::Num + Copy + 'static>(
     let cont_s0 = p.i_h * p.i_w * p.c_in;
     let cont_s1 = p.i_w * p.c_in;
     let cont_s2 = p.c_in;
+    // One destination row (all w, all c) per rayon task; inside a row the
+    // channel loop is outermost so the source reads run along w (contiguous
+    // for NCHW) and the strided writes land in a row that fits the cache.
+    // Serial, this transpose was the single-thread bottleneck of large
+    // convolutions: a 105 MB cache-hostile gather per conv call.
     let mut inp_cont = vec![T::zero(); p.b_size * p.c_in * p.i_h * p.i_w];
-    for b_idx in 0..p.b_size {
-        for h_idx in 0..p.i_h {
-            for w_idx in 0..p.i_w {
+    debug_assert_eq!(cont_s0, p.i_h * cont_s1);
+    if cont_s1 > 0 {
+        inp_cont
+            .par_chunks_mut(cont_s1)
+            .enumerate()
+            .for_each(|(row, dst_row)| {
+                let (b_idx, h_idx) = (row / p.i_h, row % p.i_h);
+                let src_row = b_idx * inp_s0 + h_idx * inp_s2;
                 for c_idx in 0..p.c_in {
-                    let src_idx = b_idx * inp_s0 + c_idx * inp_s1 + h_idx * inp_s2 + w_idx * inp_s3;
-                    let dst_idx = b_idx * cont_s0 + h_idx * cont_s1 + w_idx * cont_s2 + c_idx;
-                    inp_cont[dst_idx] = inp[src_idx]
+                    let src = src_row + c_idx * inp_s1;
+                    for w_idx in 0..p.i_w {
+                        dst_row[w_idx * cont_s2 + c_idx] = inp[src + w_idx * inp_s3];
+                    }
                 }
-            }
-        }
+            });
     }
     let inp_cont_len = inp_cont.len();
 
