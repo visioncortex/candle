@@ -263,7 +263,9 @@ impl MetalDevice {
         dtype: DType,
         _name: &str,
     ) -> Result<Arc<Buffer>> {
-        let size = element_count * dtype.size_in_bytes();
+        // Zero-length private buffers are refused by Metal too (see
+        // new_buffer_with_data); one byte for an empty tensor.
+        let size = (element_count * dtype.size_in_bytes()).max(1);
         let buffer = self
             .device
             .new_buffer(size, PRIVATE_RESOURCE_OPTIONS)
@@ -279,10 +281,19 @@ impl MetalDevice {
     /// allocates the buffer and copies over the existing data before returning the MTLBuffer.
     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<Arc<Buffer>> {
         let size = core::mem::size_of_val(data);
-        let new_buffer = self
-            .device
-            .new_buffer_with_data(data.as_ptr().cast(), size, RESOURCE_OPTIONS)
-            .map_err(MetalError::from)?;
+        // Metal refuses a zero-length buffer (newBufferWithBytes returns
+        // nil), but an empty tensor is legal everywhere else — give it a
+        // one-byte buffer with nothing copied. (The pooled paths already
+        // round 0 up through buf_size.)
+        let new_buffer = if size == 0 {
+            self.device
+                .new_buffer(1, RESOURCE_OPTIONS)
+                .map_err(MetalError::from)?
+        } else {
+            self.device
+                .new_buffer_with_data(data.as_ptr().cast(), size, RESOURCE_OPTIONS)
+                .map_err(MetalError::from)?
+        };
         let mut buffers = self.buffers.write().map_err(MetalError::from)?;
 
         let subbuffers = buffers.entry(size).or_insert(vec![]);

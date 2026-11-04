@@ -970,12 +970,17 @@ impl BackendStorage for MetalStorage {
             col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
         } else {
             // Make the kernel contiguous if not already the case.
+            // copy_strided_src materializes it into kernel_c starting at
+            // index 0, so the matmul reads KERNEL_C at offset 0 — not the
+            // original strided buffer at its start offset (the CPU fix
+            // #3736, mirrored; a channel-sliced kernel used to produce a
+            // wrong forward here).
             let mut kernel_c = self.device().zeros_impl(kernel_l.shape(), kernel.dtype())?;
             kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
-            let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
+            let kernel_l = Layout::contiguous_with_offset((1, n, k), 0)
                 .transpose(1, 2)?
                 .broadcast_as((b, k, n))?;
-            col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
+            col.matmul(&kernel_c, (b, m, n, k), &col_l, &kernel_l)?
         };
         let res_l = Layout::contiguous((b, l_out, n)).transpose(1, 2)?;
         let mut res_t = self.device().zeros_impl(res_l.shape(), res.dtype())?;
@@ -1173,12 +1178,17 @@ impl BackendStorage for MetalStorage {
             col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
         } else {
             // Make the kernel contiguous if not already the case.
+            // copy_strided_src materializes it into kernel_c starting at
+            // index 0, so the matmul reads KERNEL_C at offset 0 — not the
+            // original strided buffer at its start offset (the CPU fix
+            // #3736, mirrored; a channel-sliced kernel used to produce a
+            // wrong forward here).
             let mut kernel_c = self.device().zeros_impl(kernel_l.shape(), kernel.dtype())?;
             kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
-            let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
+            let kernel_l = Layout::contiguous_with_offset((1, n, k), 0)
                 .transpose(1, 2)?
                 .broadcast_as((b, k, n))?;
-            col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
+            col.matmul(&kernel_c, (b, m, n, k), &col_l, &kernel_l)?
         };
         let res_l = Layout::contiguous((b, h_out, w_out, n))
             .transpose(1, 2)?
@@ -1602,9 +1612,19 @@ impl BackendStorage for MetalStorage {
     }
 
     fn index_select(&self, ids: &Self, src_l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
-        if !ids_l.is_contiguous() {
-            crate::bail!("Metal index_select requires contiguous ids")
-        }
+        // The kernel reads ids contiguously; a strided view (CPU and CUDA
+        // accept one) is materialized first instead of refused.
+        let ids_c;
+        let ids_cl;
+        let (ids, ids_l) = if ids_l.is_contiguous() {
+            (ids, ids_l)
+        } else {
+            let mut c = self.device().zeros_impl(ids_l.shape(), ids.dtype)?;
+            ids.copy_strided_src(&mut c, 0, ids_l)?;
+            ids_c = c;
+            ids_cl = Layout::contiguous(ids_l.shape());
+            (&ids_c, &ids_cl)
+        };
         let left_size: usize = src_l.dims()[..dim].iter().product();
         let right_size: usize = src_l.dims()[dim + 1..].iter().product();
         let ids_el = ids_l.shape().elem_count();
