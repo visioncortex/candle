@@ -584,6 +584,32 @@ fn index_select_strided_ids_grad(device: &Device) -> Result<()> {
     Ok(())
 }
 
+/// A tensor's first gradient is stored as it comes rather than added to a
+/// fresh zeros tensor: a strided first contribution must still come back
+/// contiguous, and one gradient shared by both sides of an add must not be
+/// disturbed when one side accumulates more.
+fn first_grad_contribution(device: &Device) -> Result<()> {
+    let x = Var::new(&[[1f32, 2., 3.], [4., 5., 6.]], device)?;
+    let w = Tensor::new(&[[1f32, -2.], [3., -4.], [5., -6.]], device)?;
+    let loss = (x.t()?.affine(2., 0.)? * &w)?.sum_all()?;
+    let grads = loss.backward()?;
+    let grad_x = grads.get(&x).context("no grad for x")?;
+    assert!(grad_x.is_contiguous());
+    assert_eq!(grad_x.to_vec2::<f32>()?, [[2., 6., 10.], [-4., -8., -12.]]);
+
+    let a = Var::new(&[1f32, 2., 3.], device)?;
+    let b = Var::new(&[4f32, 5., 6.], device)?;
+    let c = Tensor::new(&[7f32, 8., 9.], device)?;
+    // the add hands one gradient (c) to both a and b; a then gets 2a on top
+    let loss = (((a.as_tensor() + b.as_tensor())? * &c)? + a.sqr()?)?.sum_all()?;
+    let grads = loss.backward()?;
+    let grad_a = grads.get(&a).context("no grad for a")?;
+    let grad_b = grads.get(&b).context("no grad for b")?;
+    assert_eq!(grad_a.to_vec1::<f32>()?, [9., 12., 15.]);
+    assert_eq!(grad_b.to_vec1::<f32>()?, [7., 8., 9.]);
+    Ok(())
+}
+
 #[test]
 fn test_flip_backprop() -> Result<()> {
     let device = &Device::Cpu;
@@ -677,4 +703,12 @@ test_device!(
     index_select_strided_ids_grad_gpu,
     index_select_strided_ids_grad_metal,
     index_select_strided_ids_grad_rocm
+);
+
+test_device!(
+    first_grad_contribution,
+    first_grad_contribution_cpu,
+    first_grad_contribution_gpu,
+    first_grad_contribution_metal,
+    first_grad_contribution_rocm
 );

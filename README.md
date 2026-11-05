@@ -16,6 +16,17 @@
   the rayon pool idle (16 threads bought 2.2× over one). They fan out over
   rayon above 256k elements with byte-identical results; the 1×1 conv's
   input reshape likewise.
+- The backward pass runs on all cores too. A sum over some dims (every conv
+  bias gradient) walked one element at a time; it now splits over output
+  elements, each still adding its sources in increasing order, so the sums
+  are bit-identical. Large `affine`, the tiled conv2d's kernel flatten
+  (activation-sized when the kernel is an output gradient) and the
+  transpose conv's input packing are parallel as well.
+- A tensor's first gradient is stored as it comes rather than added to a
+  fresh `zeros_like`, which cost a zero buffer and a full add per gradient
+  (CPU and GPU alike). Values are unchanged. With all of this a small conv
+  net's CPU training step went from 9.2 s to 1.9 s on 32 cores, with
+  byte-identical weights.
 - conv1d with a strided kernel view matmul'd the original buffer at its old
   offset (the cpu conv2d fix of #3736 had not reached conv1d).
 

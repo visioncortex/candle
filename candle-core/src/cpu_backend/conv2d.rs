@@ -20,6 +20,9 @@ enum Conv2dImpl {
 
 const DEFAULT_CONV2D_IMPL: Conv2dImpl = Conv2dImpl::TiledIm2Col;
 
+/// Flattened kernels at least this large (elements) are built in parallel.
+const K_FLAT_PAR_MIN: usize = 1 << 18;
+
 impl Map2 for Conv2D<'_> {
     const OP: &'static str = "conv2d";
     fn f<T: WithDType + num_traits::Num + Copy + 'static>(
@@ -180,12 +183,36 @@ fn conv2d_tiled<T: WithDType + num_traits::Num + Copy + 'static>(
     // with stride [k_h * k_w * c_in, 1]
     let k_size = p.c_in * p.k_h * p.k_w;
     let mut k_flat = Vec::with_capacity(p.c_out * k_size);
-    for dst_c_idx in 0..p.c_out {
-        for kh in 0..p.k_h {
-            for kw in 0..p.k_w {
+    if p.c_out * k_size >= K_FLAT_PAR_MIN {
+        // The kernel gradient of a conv is itself a conv whose "kernel" is the
+        // output gradient (spatial = the image, channels = the batch): k_flat
+        // is then as large as an activation and, serial, was the backward
+        // pass's single-thread stretch. One output channel per rayon task;
+        // inside it the input-channel loop is outermost so the reads run along
+        // kw (contiguous for NCHW). A copy, so byte-identical either way.
+        k_flat.resize(p.c_out * k_size, T::zero());
+        k_flat
+            .par_chunks_mut(k_size)
+            .enumerate()
+            .for_each(|(dst_c_idx, row)| {
                 for c_in_idx in 0..p.c_in {
-                    let k_idx = dst_c_idx * k_s0 + c_in_idx * k_s1 + kh * k_s2 + kw * k_s3;
-                    k_flat.push(k[k_idx]);
+                    for kh in 0..p.k_h {
+                        let src = dst_c_idx * k_s0 + c_in_idx * k_s1 + kh * k_s2;
+                        let dst = kh * p.k_w * p.c_in + c_in_idx;
+                        for kw in 0..p.k_w {
+                            row[dst + kw * p.c_in] = k[src + kw * k_s3];
+                        }
+                    }
+                }
+            });
+    } else {
+        for dst_c_idx in 0..p.c_out {
+            for kh in 0..p.k_h {
+                for kw in 0..p.k_w {
+                    for c_in_idx in 0..p.c_in {
+                        let k_idx = dst_c_idx * k_s0 + c_in_idx * k_s1 + kh * k_s2 + kw * k_s3;
+                        k_flat.push(k[k_idx]);
+                    }
                 }
             }
         }

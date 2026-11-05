@@ -332,6 +332,24 @@ impl ReduceSum<'_> {
                         .iter()
                         .map(|(u, _)| u)
                         .product::<usize>();
+                    if src.len() >= PAR_COPY_MIN_ELEMS && dst.len() > 1 {
+                        // One destination per task, each summed exactly as below.
+                        let min_len = (PAR_COPY_MIN_ELEMS / reduce_sz.max(1)).max(1);
+                        dst.par_iter_mut()
+                            .enumerate()
+                            .with_min_len(min_len)
+                            .for_each(|(dst_i, dst_v)| {
+                                let src_i = dst_i * reduce_sz;
+                                unsafe {
+                                    T::vec_reduce_sum(
+                                        src[src_i..src_i + reduce_sz].as_ptr(),
+                                        dst_v,
+                                        reduce_sz,
+                                    )
+                                };
+                            });
+                        return Ok(dst);
+                    }
                     for (dst_i, dst_v) in dst.iter_mut().enumerate() {
                         let src_i = dst_i * reduce_sz;
                         unsafe {
@@ -344,6 +362,10 @@ impl ReduceSum<'_> {
                     }
                     return Ok(dst);
                 };
+                if src.len() >= PAR_COPY_MIN_ELEMS && dst.len() > 1 {
+                    reduce_sum_gather_par(src, src_l.dims(), self.reduce_dims, &mut dst);
+                    return Ok(dst);
+                }
                 for (unstr_index, &src) in src.iter().enumerate() {
                     let mut dst_index = unstr_index;
                     // Set the reduce_dims indexes to 0.
@@ -379,13 +401,131 @@ impl Map1 for ReduceSum<'_> {
     }
 }
 
+/// The parallel form of `ReduceSum`'s general contiguous path (reduced dims not
+/// all trailing — a bias gradient's sum over (0, 2, 3) is the common case).
+///
+/// The serial loop walks `src` in order and adds each element into its
+/// destination, so every destination receives its sources in increasing
+/// source index. Here the work is split over destinations instead and each
+/// one still adds its sources in increasing source index, starting from the
+/// value already in `dst`: the same additions in the same order, so the
+/// result is bit-identical to the serial path at any thread count.
+///
+/// Adjacent dims of the same kind (reduced or kept) are merged first; `src`
+/// is contiguous, so a merged group is one row-major index. When the
+/// innermost group is reduced, a task is one destination and its innermost
+/// sources are a contiguous run. When it is kept, destinations come in
+/// contiguous runs that share every outer index, and a task is a slice of
+/// such a run, accumulated as a vector over the reduced positions in order.
+fn reduce_sum_gather_par<T: WithDType>(
+    src: &[T],
+    dims: &[usize],
+    reduce_dims: &[usize],
+    dst: &mut [T],
+) {
+    // (size, stride, reduced) per merged group, outermost first; size-1 dims dropped.
+    let mut groups: Vec<(usize, usize, bool)> = Vec::new();
+    for (d, &size) in dims.iter().enumerate() {
+        if size == 1 {
+            continue;
+        }
+        let reduced = reduce_dims.contains(&d);
+        match groups.last_mut() {
+            Some(g) if g.2 == reduced => g.0 *= size,
+            _ => groups.push((size, 0, reduced)),
+        }
+    }
+    let mut stride = 1;
+    for g in groups.iter_mut().rev() {
+        g.1 = stride;
+        stride *= g.0;
+    }
+    let kept: Vec<(usize, usize)> = groups.iter().filter(|g| !g.2).map(|g| (g.0, g.1)).collect();
+    let red: Vec<(usize, usize)> = groups.iter().filter(|g| g.2).map(|g| (g.0, g.1)).collect();
+    let n_red: usize = red.iter().map(|g| g.0).product();
+    // The source offset of destination `d`: its kept indices against their strides.
+    let base_of = |mut d: usize| {
+        let mut base = 0;
+        for &(size, stride) in kept.iter().rev() {
+            base += (d % size) * stride;
+            d /= size;
+        }
+        base
+    };
+    // Visit the reduced positions' offsets in increasing order (an odometer,
+    // innermost group fastest), `outer` of them excluding an innermost run.
+    let for_each_red = |groups: &[(usize, usize)], f: &mut dyn FnMut(usize)| {
+        let mut idx = vec![0usize; groups.len()];
+        let total: usize = groups.iter().map(|g| g.0).product();
+        let mut off = 0usize;
+        for _ in 0..total {
+            f(off);
+            for (k, &(size, stride)) in groups.iter().enumerate().rev() {
+                idx[k] += 1;
+                off += stride;
+                if idx[k] < size {
+                    break;
+                }
+                off -= size * stride;
+                idx[k] = 0;
+            }
+        }
+    };
+    let inner_reduced = groups.last().is_some_and(|g| g.2);
+    if inner_reduced {
+        let (run, _) = *red.last().unwrap();
+        let outer = &red[..red.len() - 1];
+        let min_len = (PAR_COPY_MIN_ELEMS / n_red.max(1)).max(1);
+        dst.par_iter_mut()
+            .enumerate()
+            .with_min_len(min_len)
+            .for_each(|(d, v)| {
+                let base = base_of(d);
+                let mut acc = *v;
+                for_each_red(outer, &mut |off| {
+                    for &s in &src[base + off..base + off + run] {
+                        acc += s;
+                    }
+                });
+                *v = acc;
+            });
+    } else {
+        // Destinations are runs of the innermost kept group; split each run
+        // into slices so a short outer extent still feeds every thread.
+        let (run, _) = *kept.last().unwrap();
+        let slice = run.min((PAR_COPY_MIN_ELEMS / n_red.max(1)).clamp(64, 4096));
+        dst.par_chunks_mut(run).enumerate().for_each(|(r, row)| {
+            let base = base_of(r * run);
+            row.par_chunks_mut(slice).enumerate().for_each(|(c, acc)| {
+                let (lo, len) = (base + c * slice, acc.len());
+                for_each_red(&red, &mut |off| {
+                    for (a, &s) in acc.iter_mut().zip(&src[lo + off..lo + off + len]) {
+                        *a += s;
+                    }
+                });
+            });
+        });
+    }
+}
+
 struct Affine(f64, f64);
 
 impl Map1 for Affine {
     fn f<T: WithDType>(&self, vs: &[T], layout: &Layout) -> Result<Vec<T>> {
         let mul = T::from_f64(self.0);
         let add = T::from_f64(self.1);
-        Ok(unary_map(vs, layout, |v| v * mul + add))
+        // Elementwise, so the parallel split (a single contiguous block above
+        // PAR_ELEMWISE_MIN) is byte-identical to the serial map.
+        Ok(unary_map_vec_par(
+            vs,
+            layout,
+            |v| v * mul + add,
+            |xs: &[T], ys: &mut [T]| {
+                for (y, &x) in ys.iter_mut().zip(xs) {
+                    *y = x * mul + add
+                }
+            },
+        ))
     }
 }
 
@@ -1434,14 +1574,32 @@ impl Map2 for ConvTranspose2D<'_> {
         let cont_s0 = p.i_h * p.i_w * p.c_in;
         let cont_s1 = p.i_w * p.c_in;
         let cont_s2 = p.c_in;
-        for b_idx in 0..p.b_size {
-            for h_idx in 0..p.i_h {
-                for w_idx in 0..p.i_w {
+        if inp_cont.len() >= PAR_COPY_MIN_ELEMS && cont_s1 > 0 {
+            // One (b, y) row of the NHWC copy per task, channel loop outermost
+            // so the reads run contiguous (as conv2d's transpose, 11-04).
+            inp_cont
+                .par_chunks_mut(cont_s1)
+                .enumerate()
+                .for_each(|(row, dst)| {
+                    let (b_idx, h_idx) = (row / p.i_h, row % p.i_h);
                     for c_idx in 0..p.c_in {
-                        let src_idx =
-                            b_idx * inp_s0 + c_idx * inp_s1 + h_idx * inp_s2 + w_idx * inp_s3;
-                        let dst_idx = b_idx * cont_s0 + h_idx * cont_s1 + w_idx * cont_s2 + c_idx;
-                        inp_cont[dst_idx] = inp[src_idx]
+                        let src = b_idx * inp_s0 + c_idx * inp_s1 + h_idx * inp_s2;
+                        for w_idx in 0..p.i_w {
+                            dst[w_idx * cont_s2 + c_idx] = inp[src + w_idx * inp_s3];
+                        }
+                    }
+                });
+        } else {
+            for b_idx in 0..p.b_size {
+                for h_idx in 0..p.i_h {
+                    for w_idx in 0..p.i_w {
+                        for c_idx in 0..p.c_in {
+                            let src_idx =
+                                b_idx * inp_s0 + c_idx * inp_s1 + h_idx * inp_s2 + w_idx * inp_s3;
+                            let dst_idx =
+                                b_idx * cont_s0 + h_idx * cont_s1 + w_idx * cont_s2 + c_idx;
+                            inp_cont[dst_idx] = inp[src_idx]
+                        }
                     }
                 }
             }
