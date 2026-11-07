@@ -417,8 +417,13 @@ fn candle_num_threads() -> usize {
 }
 
 pub fn get_num_threads() -> usize {
-    // Respond to the same environment variable as rayon.
-    rayon_num_threads()
+    // Respond to the same environment variable as rayon. Computed once: the
+    // default path parses /proc/cpuinfo (num_cpus::get_physical), and this is
+    // asked on every matmul and every fanned-out copy — a 512x512 x2 pass on a
+    // 16-core box opened /proc/cpuinfo 20k times and spent 30% of its CPU
+    // time in the kernel (2026-11-07).
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(rayon_num_threads)
 }
 
 /// On Apple Silicon: P-core count via `hw.perflevel0.logicalcpu`.

@@ -29,6 +29,11 @@
   byte-identical weights.
 - conv1d with a strided kernel view matmul'd the original buffer at its old
   offset (the cpu conv2d fix of #3736 had not reached conv1d).
+- The thread count is computed once. `get_num_threads` re-parsed
+  `/proc/cpuinfo` (`num_cpus::get_physical`) on every matmul and every
+  fanned-out copy: a 512×512 x2 pass opened it 20k times and a whole-image
+  x8 chain spent 30% of its CPU time in the kernel (x8 26.6 s → 18.4 s on
+  16 cores, system time 207 s → 22 s).
 
 **Metal (Apple Silicon)**
 - `MetalDevice::new` panicked on M-series: the system default device is used.
