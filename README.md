@@ -94,6 +94,14 @@
   semantics (including strided inputs and kernels) match the CUDA and ROCm
   paths exactly; `vulkan_conv_pool_upsample_match_cpu` checks them against
   the CPU backend.
+- Tuned for convolutional nets: freed blocks stay mapped for reuse
+  (`CANDLE_VULKAN_CACHE_LIMIT_MB`, default 1024), conv2d reuses a
+  device-owned im2col scratch, and a reduction of few long rows (group
+  norm) is split across ~1k work-groups. On a Strix Halo iGPU (RADV) a
+  4.5M-parameter conv U-Net's x8 inference runs in 11.4 s against 12.1 s
+  through ROCm and 26 s on 16 CPU cores, with the output within 1 LSB of
+  the CPU's. `cargo run --release -p candle-core --features vulkan
+  --example conv_bench -- vulkan` times the building blocks per device.
 
 [![discord server](https://dcbadge.limes.pink/api/server/hugging-face-879548962464493619)](https://discord.gg/hugging-face-879548962464493619)
 [![Latest version](https://img.shields.io/crates/v/candle-core.svg)](https://crates.io/crates/candle-core)
