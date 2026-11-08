@@ -658,6 +658,41 @@ void main() {
     s
 }
 
+/// Partial row reduction: one work-group per (row, chunk) over
+/// `[chunk * chunk_len, min(cols, (chunk + 1) * chunk_len))`, written to
+/// `o[row * chunks + chunk]`. Push: `rows, cols, off, op, chunks, chunk_len`.
+pub fn k_reduce_last_split(wg: usize) -> String {
+    let mut s = prelude(wg, 2);
+    s += &buf(0, "float", "x", true);
+    s += &buf(1, "float", "o", false);
+    s += RED_FN;
+    s += r#"
+layout(push_constant) uniform PC { int rows; int cols; int off; int op; int chunks; int chunk_len; } pc;
+layout(local_size_x = WG) in;
+shared float sh[WG];
+void main() {
+    int g = grow();
+    int t = int(gl_LocalInvocationID.x);
+    if (g >= pc.rows * pc.chunks) return;
+    int row = g / pc.chunks;
+    int c = g - row * pc.chunks;
+    int start = c * pc.chunk_len;
+    int end = min(start + pc.chunk_len, pc.cols);
+    int base = pc.off + row * pc.cols;
+    float acc = red_init(pc.op);
+    for (int i = start + t; i < end; i += WG) acc = red_f(acc, x[base + i], pc.op);
+    sh[t] = acc;
+    barrier();
+    for (int s = WG / 2; s > 0; s >>= 1) {
+        if (t < s) sh[t] = red_f(sh[t], sh[t + s], pc.op);
+        barrier();
+    }
+    if (t == 0) o[g] = sh[0];
+}
+"#;
+    s
+}
+
 /// Generic reduction: one invocation per output element; `ix` maps output
 /// indices to the input base (reduced dims: stride 0, dim 1), `rd`
 /// enumerates the reduced sub-space.  Push: `n, count, op`.

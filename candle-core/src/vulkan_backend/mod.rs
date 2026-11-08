@@ -86,10 +86,26 @@ struct Allocator {
     blocks: Vec<Option<Block>>,
     chunk: u64,
     mem_type: u32,
+    /// Bytes of empty dedicated blocks kept for reuse (see
+    /// [`Allocator::trim_dedicated_cache`]).
+    cache_limit: u64,
 }
 
 /// Default block size; requests above a quarter of it get a dedicated block.
 const CHUNK_BYTES: u64 = 128 << 20;
+
+/// `CANDLE_VULKAN_CACHE_LIMIT_MB` (default 1024): how much of the dedicated
+/// blocks that fall empty the allocator keeps mapped for reuse. A conv's
+/// im2col scratch (hundreds of MB at a 512-px tile) is allocated and dropped
+/// once per call; without the cache every call paid `vkAllocateMemory` +
+/// `vkMapMemory` + the kernel's page faults, which was most of the wall time.
+fn cache_limit_bytes() -> u64 {
+    std::env::var("CANDLE_VULKAN_CACHE_LIMIT_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1024)
+        << 20
+}
 
 fn align_up(v: u64, a: u64) -> u64 {
     if a <= 1 {
@@ -134,6 +150,39 @@ impl Allocator {
                         ptr,
                     ));
                 }
+            }
+        }
+        if dedicated {
+            // A cached empty dedicated block that fits without undue waste:
+            // the smallest one at least `size` and at most twice it.
+            let mut best: Option<(usize, u64)> = None;
+            for (bi, slot) in self.blocks.iter().enumerate() {
+                let Some(b) = slot else { continue };
+                if !b.dedicated || b.free.len() != 1 || b.free[0] != (0, b.size) {
+                    continue;
+                }
+                if b.size >= size
+                    && b.size <= size.saturating_mul(2)
+                    && best.is_none_or(|(_, s)| b.size < s)
+                {
+                    best = Some((bi, b.size));
+                }
+            }
+            if let Some((bi, _)) = best {
+                let b = self.blocks[bi].as_mut().unwrap();
+                b.free = if b.size > size {
+                    vec![(size, b.size - size)]
+                } else {
+                    Vec::new()
+                };
+                return Ok((
+                    Alloc {
+                        block: bi,
+                        offset: 0,
+                        size,
+                    },
+                    b.mapped,
+                ));
             }
         }
         let bsize = if dedicated { size } else { self.chunk };
@@ -207,20 +256,35 @@ impl Allocator {
         }
         let empty = b.free.len() == 1 && b.free[0] == (0, b.size);
         if empty {
-            let dedicated = b.dedicated;
-            // Return dedicated blocks at once; keep one empty chunk around.
-            let another_empty = self.blocks.iter().enumerate().any(|(i, s)| {
-                i != a.block
-                    && s.as_ref().is_some_and(|x| {
-                        !x.dedicated && x.free.len() == 1 && x.free[0] == (0, x.size)
-                    })
-            });
-            if dedicated || another_empty {
-                let b = self.blocks[a.block].take().unwrap();
-                unsafe {
-                    device.unmap_memory(b.memory);
-                    device.free_memory(b.memory, None);
+            // Empty blocks stay mapped for reuse within the cache budget.
+            self.trim_cache(device);
+        }
+    }
+
+    /// Return the largest empty blocks to the driver until the ones kept
+    /// (dedicated and chunks alike; a chunk is refilled by the next
+    /// sub-allocation) fit `cache_limit`.
+    fn trim_cache(&mut self, device: &ash::Device) {
+        loop {
+            let mut total = 0u64;
+            let mut largest: Option<(usize, u64)> = None;
+            for (bi, slot) in self.blocks.iter().enumerate() {
+                let Some(b) = slot else { continue };
+                if b.free.len() == 1 && b.free[0] == (0, b.size) {
+                    total += b.size;
+                    if largest.is_none_or(|(_, s)| b.size > s) {
+                        largest = Some((bi, b.size));
+                    }
                 }
+            }
+            if total <= self.cache_limit {
+                return;
+            }
+            let Some((bi, _)) = largest else { return };
+            let b = self.blocks[bi].take().unwrap();
+            unsafe {
+                device.unmap_memory(b.memory);
+                device.free_memory(b.memory, None);
             }
         }
     }
@@ -228,8 +292,9 @@ impl Allocator {
 
 // ─── Device ──────────────────────────────────────────────────────────────────
 
-/// One private, reusable dequantization target. It deliberately owns no
-/// VulkanDevice/Arc: storing a VulkanStorage in its device would form a cycle.
+/// One private, reusable device buffer (the dequantization target, the
+/// conv im2col scratch). It deliberately owns no VulkanDevice/Arc: storing
+/// a VulkanStorage in its device would form a cycle.
 struct QuantGemmScratch {
     buffer: vk::Buffer,
     alloc: Alloc,
@@ -255,6 +320,12 @@ struct VulkanContext {
     // both dispatches so concurrent requests cannot overwrite another GEMM's
     // weights between dequantization and use.
     quant_gemm_scratch: Mutex<Option<QuantGemmScratch>>,
+    // The conv2d im2col column matrix and chunk result, reused across calls
+    // (a fresh allocation per conv cost more than the conv itself). Lock
+    // order: conv_scratch -> exec -> mem; held through a conv's dispatches,
+    // which the per-dispatch compute barrier orders against the previous
+    // conv's reads. Never held together with quant_gemm_scratch.
+    conv_scratch: Mutex<[Option<QuantGemmScratch>; 2]>,
     exec: std::mem::ManuallyDrop<Mutex<kernels::Exec>>,
     pipes: Mutex<kernels::PipeMap>,
     layouts: Mutex<HashMap<u32, Arc<kernels::Layouts>>>,
@@ -275,6 +346,15 @@ impl Drop for VulkanContext {
                 .get_mut()
                 .unwrap_or_else(|p| p.into_inner())
                 .take()
+            {
+                self.device.destroy_buffer(scratch.buffer, None);
+            }
+            for scratch in self
+                .conv_scratch
+                .get_mut()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter_mut()
+                .filter_map(Option::take)
             {
                 self.device.destroy_buffer(scratch.buffer, None);
             }
@@ -695,9 +775,11 @@ fn init_vulkan(gpu_id: usize, qgemv: Option<kernels::Qgemv>) -> Result<VulkanDev
             mem: Mutex::new(Allocator {
                 blocks: Vec::new(),
                 chunk: CHUNK_BYTES,
+                cache_limit: cache_limit_bytes(),
                 mem_type,
             }),
             quant_gemm_scratch: Mutex::new(None),
+            conv_scratch: Mutex::new([None, None]),
             exec: std::mem::ManuallyDrop::new(Mutex::new(exec)),
             pipes: Mutex::new(HashMap::new()),
             layouts: Mutex::new(HashMap::new()),
@@ -1840,6 +1922,28 @@ impl BackendStorage for VulkanStorage {
 
 // ─── Native op bodies ────────────────────────────────────────────────────────
 
+/// The buffer in `slot`, grown to at least `bytes` (a previous, smaller one
+/// is released after the batch that may still read it), as a kernel
+/// argument.
+fn scratch_buf(dev: &VulkanDevice, slot: &mut Option<QuantGemmScratch>, bytes: u64) -> Result<Buf> {
+    let bytes = bytes.max(4);
+    if slot.as_ref().is_none_or(|s| s.capacity < bytes) {
+        let (buffer, alloc, _) = dev.alloc_raw(bytes)?;
+        if let Some(old) = slot.replace(QuantGemmScratch {
+            buffer,
+            alloc,
+            capacity: bytes,
+        }) {
+            dev.release(old.buffer, old.alloc);
+        }
+    }
+    let s = slot.as_ref().unwrap();
+    Ok(Buf {
+        buffer: s.buffer,
+        bytes: s.capacity,
+    })
+}
+
 impl VulkanStorage {
     /// conv2d as im2col + GEMM, the way the CUDA and ROCm backends run it.
     /// The column matrix is built in chunks of whole output rows so the
@@ -1874,13 +1978,24 @@ impl VulkanStorage {
         } else {
             (cap / row_bytes).clamp(1, h_out.max(1))
         };
-        let col = self.device.alloc(DType::F32, rows * w_out * k)?;
+        let mut scratch = self
+            .device
+            .inner
+            .conv_scratch
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let [col_slot, res_slot] = &mut *scratch;
+        let col = scratch_buf(&self.device, col_slot, (rows * w_out * k * 4) as u64)?;
         // One chunk covering one image writes the output planes directly;
         // otherwise each chunk lands in `res` and is copied into place.
         let res = if b == 1 && rows >= h_out {
             None
         } else {
-            Some(self.device.alloc(DType::F32, n * rows * w_out)?)
+            Some(scratch_buf(
+                &self.device,
+                res_slot,
+                (n * rows * w_out * 4) as u64,
+            )?)
         };
         for bi in 0..b {
             let mut h0 = 0;
@@ -1888,7 +2003,7 @@ impl VulkanStorage {
                 let r = rows.min(h_out - h0);
                 let cm = r * w_out;
                 let dst_base = (bi * h_out + h0) * w_out * k;
-                kernels::run_im2col(&self.device, self.buf(), col.buf(), cm * k, dst_base, l, p)?;
+                kernels::run_im2col(&self.device, self.buf(), col, cm * k, dst_base, l, p)?;
                 let sa = kernels::MatStrides {
                     row: k,
                     col: 1,
@@ -1902,21 +2017,21 @@ impl VulkanStorage {
                     offset: 0,
                     batch: 0,
                 };
-                let target = res.as_ref().unwrap_or(&out);
+                let target = res.unwrap_or(out.buf());
                 kernels::run_matmul(
                     &self.device,
                     kernel.buf(),
-                    col.buf(),
-                    target.buf(),
+                    col,
+                    target,
                     (1, n, cm, k),
                     sa,
                     sb,
                 )?;
-                if let Some(res) = &res {
+                if let Some(res) = res {
                     kernels::run_copy2d(
                         &self.device,
                         4,
-                        res.buf(),
+                        res,
                         out.buf(),
                         n,
                         cm,
@@ -2058,6 +2173,29 @@ impl VulkanStorage {
                         out.buf(),
                         rows,
                         &Layout::contiguous(rows),
+                        0,
+                    )?;
+                } else if let Some(chunks) = kernels::split_reduce_chunks(rows, cols) {
+                    // Few long rows (group norm's statistics): partial
+                    // reductions over row chunks, then a reduction of those.
+                    let tmp = self.device.alloc(DType::F32, rows * chunks)?;
+                    kernels::run_reduce_last_split(
+                        &self.device,
+                        code,
+                        self.buf(),
+                        tmp.buf(),
+                        rows,
+                        cols,
+                        o1,
+                        chunks,
+                    )?;
+                    kernels::run_reduce_last(
+                        &self.device,
+                        code,
+                        tmp.buf(),
+                        out.buf(),
+                        rows,
+                        chunks,
                         0,
                     )?;
                 } else {

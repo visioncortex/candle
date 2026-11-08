@@ -1534,6 +1534,52 @@ pub fn run_reduce_last(
     )
 }
 
+/// For a row reduction of few long rows (group norm's statistics: 4 rows
+/// of a million elements), how many chunks to split each row into so the
+/// device has about a thousand work-groups instead of one per row; `None`
+/// when one group per row is already enough.
+pub fn split_reduce_chunks(rows: usize, cols: usize) -> Option<usize> {
+    const TARGET_GROUPS: usize = 1024;
+    const MIN_CHUNK: usize = 1024;
+    if rows >= TARGET_GROUPS || cols < 2 * MIN_CHUNK {
+        return None;
+    }
+    let chunks = TARGET_GROUPS.div_ceil(rows).min(cols / MIN_CHUNK);
+    (chunks > 1).then_some(chunks)
+}
+
+/// Partial row reductions: `out[row * chunks + c]` reduces chunk `c` of
+/// `row`; a `run_reduce_last` over `(rows, chunks)` finishes the job.
+#[allow(clippy::too_many_arguments)]
+pub fn run_reduce_last_split(
+    d: &VulkanDevice,
+    op: i32,
+    x: Buf,
+    out: Buf,
+    rows: usize,
+    cols: usize,
+    off: usize,
+    chunks: usize,
+) -> Result<()> {
+    let chunk_len = cols.div_ceil(chunks);
+    let push = Push::default()
+        .us(rows)?
+        .us(cols)?
+        .us(off)?
+        .i(op)
+        .us(chunks)?
+        .us(chunk_len)?;
+    let lim = d.limits();
+    d.launch(
+        "reduce_last_split",
+        glsl::k_reduce_last_split,
+        &[x, out],
+        push,
+        &[],
+        row_grid(rows * chunks, 1, lim.max_groups_x),
+    )
+}
+
 pub fn run_arg_last(
     d: &VulkanDevice,
     is_max: bool,
