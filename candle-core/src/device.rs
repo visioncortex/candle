@@ -273,6 +273,8 @@ impl Device {
             Self::Cpu => crate::bail!("expected a vulkan device, got cpu"),
             Self::Cuda(_) => crate::bail!("expected a vulkan device, got cuda"),
             Self::Metal(_) => crate::bail!("expected a vulkan device, got Metal"),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(_) => crate::bail!("expected a vulkan device, got ROCm"),
         }
     }
 
@@ -283,6 +285,7 @@ impl Device {
             Self::Metal(d) => Ok(d),
             #[cfg(feature = "rocm")]
             Self::Rocm(_) => crate::bail!("expected a metal device, got rocM"),
+            Self::Vulkan(_) => crate::bail!("expected a metal device, got Vulkan"),
         }
     }
 
@@ -293,7 +296,7 @@ impl Device {
             Self::Cpu => crate::bail!("expected a rocm device, got cpu"),
             Self::Metal(_) => crate::bail!("expected a rocm device, got Metal"),
             Self::Rocm(d) => Ok(d),
-            Self::Vulkan(_) => crate::bail!("expected a metal device, got Vulkan"),
+            Self::Vulkan(_) => crate::bail!("expected a rocm device, got Vulkan"),
         }
     }
 

@@ -1456,7 +1456,6 @@ impl crate::CustomOp1 for QTensor {
             QStorage::Cpu(storage) => storage,
             #[cfg(feature = "rocm")]
             QStorage::Rocm(_) => crate::bail!("Invalid storage"),
-            QStorage::Metal(_) | QStorage::Cuda(_) => crate::bail!("Invalid storage"),
             QStorage::Metal(_) | QStorage::Cuda(_) | QStorage::Vulkan(_) => {
                 crate::bail!("Invalid storage")
             }
