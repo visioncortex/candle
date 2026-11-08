@@ -1,7 +1,7 @@
 # candle
 
 > **This is the visioncortex fork** — upstream candle at 0.11.0
-> (`2cf0e66d`) plus the fixes and the ROCm backend listed below, published
+> (`2cf0e66d`) plus the fixes and the ROCm and Vulkan backends listed below, published
 > as 0.11.1 on branch `main`. The public API is upstream's; every change is
 > a fix, a backend or a performance path behind it. The list is kept in
 > order of the layers as they sit on upstream.
@@ -73,6 +73,28 @@
 - Tests needing `hipMemCreate` skip on APUs that lack it (gfx1151, Strix
   Halo), so the suite runs on integrated parts as well as discrete cards.
 
+**Vulkan — a new backend, `--features vulkan` (inference)**
+- `candle-core/src/vulkan_backend`: the Vulkan backend of upstream
+  [#4096](https://github.com/huggingface/candle/pull/4096) (nglmercer's port
+  of [rexlunae/candle-core](https://github.com/rexlunae/candle-core)
+  `joshua-vulkan`), applied here as its Vulkan-only diff. `ash` loads
+  libvulkan at runtime and `naga` compiles the GLSL kernels to SPIR-V on
+  first use, so neither a Vulkan SDK nor `glslc` is needed to build or run;
+  any Vulkan 1.1 GPU with a conformant driver (RADV, NVIDIA, Intel ANV,
+  Mesa on Android) is a target. f32 kernels for elementwise ops, strided
+  copies, casts, reductions, index ops, GEMM/GEMV, softmax/RMSNorm/RoPE and
+  the quantized GGUF matmuls; software devices (lavapipe) are refused
+  unless `CANDLE_VULKAN_ALLOW_CPU=1`. Ops without a kernel take a counted
+  CPU round-trip (`vulkan_backend::stats()`, `CANDLE_VULKAN_TRACE=1`).
+- Added here on top of the PR: conv2d (im2col in chunks of whole output
+  rows, capped at 256 MB, then GEMM straight into the output planes),
+  conv_transpose2d, avg/max pooling and nearest upsampling as native
+  kernels — the ops a convolutional net spends its time in, which the PR
+  still ran on the CPU. Ported from `candle-kernels/src/conv.cu`, so the
+  semantics (including strided inputs and kernels) match the CUDA and ROCm
+  paths exactly; `vulkan_conv_pool_upsample_match_cpu` checks them against
+  the CPU backend.
+
 [![discord server](https://dcbadge.limes.pink/api/server/hugging-face-879548962464493619)](https://discord.gg/hugging-face-879548962464493619)
 [![Latest version](https://img.shields.io/crates/v/candle-core.svg)](https://crates.io/crates/candle-core)
 [![Documentation](https://docs.rs/candle-core/badge.svg)](https://docs.rs/candle-core)
@@ -124,6 +146,13 @@ On an AMD GPU, build with the `rocm` feature and use:
 ```diff
 - let device = Device::Cpu;
 + let device = Device::new_rocm(0)?;
+```
+
+On any GPU with a Vulkan driver, build with the `vulkan` feature and use:
+
+```diff
+- let device = Device::Cpu;
++ let device = Device::new_vulkan(0)?;
 ```
 
 For more advanced examples, please have a look at the following section.
@@ -245,6 +274,12 @@ layers over `cuda`. The ROCm backend started from
 [@airpods69](https://github.com/airpods69)'s
 [#3424](https://github.com/huggingface/candle/pull/3424); see
 [candle-rocm-kernels](./candle-rocm-kernels/README.md#origin).
+
+For **any GPU with a Vulkan driver** add `--features vulkan`. Nothing is
+needed at build time: the Vulkan loader is opened at runtime and the GLSL
+kernels are compiled to SPIR-V in-process by `naga` on first use. The backend
+is inference-oriented (no RNG or backward-specific kernels; those ops fall
+back to the CPU and are counted in `vulkan_backend::stats()`).
 
 There are also some wasm examples for whisper and
 [llama2.c](https://github.com/karpathy/llama2.c). You can either build them with

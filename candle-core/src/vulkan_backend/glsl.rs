@@ -2261,3 +2261,173 @@ pub fn k_binary_precise(wg: usize) -> String {
         "case 3: return float(double(a)/double(b));",
     )
 }
+
+// ─── Convolution, pooling, upsampling ─────────────────────────────────────────
+//
+// Scalar one-invocation-per-output kernels, ported from candle-kernels'
+// `conv.cu` (the CUDA and ROCm backends run the same loops). f32 only.
+// Sources are read through their NCHW strides and start offset, so a
+// strided or narrowed input needs no contiguous copy; outputs are written
+// contiguous. Every scalar argument travels as a push constant.
+
+/// im2col for conv2d: `col[0..n)` receives elements `[dst_base, dst_base + n)`
+/// of the (b, h_out, w_out, c_in, k_h, k_w) column matrix of `x`, so a
+/// caller can build the matrix in chunks of whole output rows.
+/// Push: `n, dst_base, h_out, w_out, k_h, k_w, stride, padding, dilation,
+/// c_in, h_in, w_in, s0, s1, s2, s3, src_off`.
+pub fn k_im2col(wg: usize) -> String {
+    let mut s = prelude(wg, 2);
+    s += &buf(0, "float", "x", true);
+    s += &buf(1, "float", "col", false);
+    s += r#"
+layout(push_constant) uniform PC {
+    int n; int dst_base; int h_out; int w_out; int k_h; int k_w;
+    int stride; int padding; int dilation; int c_in; int h_in; int w_in;
+    int s0; int s1; int s2; int s3; int src_off;
+} pc;
+layout(local_size_x = WG) in;
+void main() {
+    int i = gid();
+    if (i >= pc.n) return;
+    int t = i + pc.dst_base;
+    int kw = t % pc.k_w; t /= pc.k_w;
+    int kh = t % pc.k_h; t /= pc.k_h;
+    int c = t % pc.c_in; t /= pc.c_in;
+    int ow = t % pc.w_out; t /= pc.w_out;
+    int oh = t % pc.h_out; t /= pc.h_out;
+    int b = t;
+    int ih = oh * pc.stride + kh * pc.dilation - pc.padding;
+    int iw = ow * pc.stride + kw * pc.dilation - pc.padding;
+    float v = 0.0;
+    if (ih >= 0 && ih < pc.h_in && iw >= 0 && iw < pc.w_in) {
+        v = x[pc.src_off + b * pc.s0 + c * pc.s1 + ih * pc.s2 + iw * pc.s3];
+    }
+    col[i] = v;
+}
+"#;
+    s
+}
+
+/// Direct transposed convolution: one invocation per output element of the
+/// contiguous (b, c_out, h_out, w_out) result; the kernel is (c_in, c_out,
+/// k_h, k_w) read through its own strides.
+/// Push: `n, h_out, w_out, stride, padding, dilation, c_in, c_out, h_in,
+/// w_in, k_h, k_w, s0..s3, src_off, ks0..ks3, k_off`.
+pub fn k_conv_transpose2d(wg: usize) -> String {
+    let mut s = prelude(wg, 3);
+    s += &buf(0, "float", "x", true);
+    s += &buf(1, "float", "w", true);
+    s += &buf(2, "float", "o", false);
+    s += r#"
+layout(push_constant) uniform PC {
+    int n; int h_out; int w_out; int stride; int padding; int dilation;
+    int c_in; int c_out; int h_in; int w_in; int k_h; int k_w;
+    int s0; int s1; int s2; int s3; int src_off;
+    int ks0; int ks1; int ks2; int ks3; int k_off;
+} pc;
+layout(local_size_x = WG) in;
+void main() {
+    int i = gid();
+    if (i >= pc.n) return;
+    int ox = i % pc.w_out; int t = i / pc.w_out;
+    int oy = t % pc.h_out; t /= pc.h_out;
+    int oc = t % pc.c_out;
+    int b = t / pc.c_out;
+    float acc = 0.0;
+    for (int kx = 0; kx < pc.k_w; kx++) {
+        int sx = ox + pc.padding - kx * pc.dilation;
+        if (sx < 0 || sx % pc.stride != 0) continue;
+        int ix = sx / pc.stride;
+        if (ix >= pc.w_in) continue;
+        for (int ky = 0; ky < pc.k_h; ky++) {
+            int sy = oy + pc.padding - ky * pc.dilation;
+            if (sy < 0 || sy % pc.stride != 0) continue;
+            int iy = sy / pc.stride;
+            if (iy >= pc.h_in) continue;
+            int xo = pc.src_off + b * pc.s0 + iy * pc.s2 + ix * pc.s3;
+            int ko = pc.k_off + oc * pc.ks1 + ky * pc.ks2 + kx * pc.ks3;
+            for (int ic = 0; ic < pc.c_in; ic++) {
+                acc += x[xo + ic * pc.s1] * w[ko + ic * pc.ks0];
+            }
+        }
+    }
+    o[i] = acc;
+}
+"#;
+    s
+}
+
+/// avg / max pooling over (k_h, k_w) windows at (s_h, s_w) strides; one
+/// invocation per output element of the contiguous (b, c, h_out, w_out)
+/// result. Windows that run past the input are clipped, as in `conv.cu`.
+/// Push: `n, k_h, k_w, s_h, s_w, c, h_in, w_in, h_out, w_out, s0..s3, src_off`.
+pub fn k_pool2d(wg: usize, max: bool) -> String {
+    let mut s = prelude(wg, 2);
+    s += &buf(0, "float", "x", true);
+    s += &buf(1, "float", "o", false);
+    let (init, step, fin) = if max {
+        ("NINF()", "acc = max(acc, v);", "acc")
+    } else {
+        ("0.0", "acc += v;", "acc * (1.0 / float(pc.k_h * pc.k_w))")
+    };
+    s += &format!(
+        r#"
+layout(push_constant) uniform PC {{
+    int n; int k_h; int k_w; int s_h; int s_w; int c; int h_in; int w_in;
+    int h_out; int w_out; int s0; int s1; int s2; int s3; int src_off;
+}} pc;
+layout(local_size_x = WG) in;
+void main() {{
+    int i = gid();
+    if (i >= pc.n) return;
+    int ow = i % pc.w_out; int t = i / pc.w_out;
+    int oh = t % pc.h_out; t /= pc.h_out;
+    int c = t % pc.c;
+    int b = t / pc.c;
+    int base = pc.src_off + b * pc.s0 + c * pc.s1;
+    float acc = {init};
+    for (int m = 0; m < pc.k_h; m++) {{
+        int ih = oh * pc.s_h + m;
+        if (ih >= pc.h_in) continue;
+        for (int q = 0; q < pc.k_w; q++) {{
+            int iw = ow * pc.s_w + q;
+            if (iw >= pc.w_in) continue;
+            float v = x[base + ih * pc.s2 + iw * pc.s3];
+            {step}
+        }}
+    }}
+    o[i] = {fin};
+}}
+"#
+    );
+    s
+}
+
+/// Nearest-neighbour 2-D upsample to (h_out, w_out): source row/column
+/// `floor(o * in / out)`, clamped, computed in integers (exact where the
+/// CPU's `f64` product is exact, which is every integer ratio).
+/// Push: `n, c, h_in, w_in, h_out, w_out, s0..s3, src_off`.
+pub fn k_upsample_nearest2d(wg: usize) -> String {
+    let mut s = prelude(wg, 2);
+    s += &buf(0, "float", "x", true);
+    s += &buf(1, "float", "o", false);
+    s += r#"
+layout(push_constant) uniform PC {
+    int n; int c; int h_in; int w_in; int h_out; int w_out;
+    int s0; int s1; int s2; int s3; int src_off;
+} pc;
+layout(local_size_x = WG) in;
+void main() {
+    int i = gid();
+    if (i >= pc.n) return;
+    int ow = i % pc.w_out; int t = i / pc.w_out;
+    int oh = t % pc.h_out; t /= pc.h_out;
+    int c = t % pc.c;
+    int b = t / pc.c;
+    int ih = min((oh * pc.h_in) / pc.h_out, pc.h_in - 1);
+    int iw = min((ow * pc.w_in) / pc.w_out, pc.w_in - 1);
+    o[i] = x[pc.src_off + b * pc.s0 + c * pc.s1 + ih * pc.s2 + iw * pc.s3];
+}
+"#;
+    s
+}

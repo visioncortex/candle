@@ -1544,7 +1544,12 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
-        if native() {
+        if native() && self.dtype == DType::F32 && kernel.dtype == DType::F32 {
+            match self.conv2d_native(l, kernel, kernel_l, params) {
+                Ok(out) => return Ok(out),
+                Err(e) => kernels::note_fallback("conv2d", Some(&e)),
+            }
+        } else if native() {
             kernels::note_fallback("conv2d", None);
         }
         let inp = self.to_cpu_storage()?;
@@ -1560,7 +1565,12 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConvTranspose2D,
     ) -> Result<Self> {
-        if native() {
+        if native() && self.dtype == DType::F32 && kernel.dtype == DType::F32 {
+            match self.conv_transpose2d_native(l, kernel, kernel_l, params) {
+                Ok(out) => return Ok(out),
+                Err(e) => kernels::note_fallback("conv_transpose2d", Some(&e)),
+            }
+        } else if native() {
             kernels::note_fallback("conv_transpose2d", None);
         }
         let inp = self.to_cpu_storage()?;
@@ -1766,12 +1776,28 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn avg_pool2d(&self, layout: &Layout, k: (usize, usize), s: (usize, usize)) -> Result<Self> {
+        if native() && self.dtype == DType::F32 {
+            match self.pool2d_native(false, layout, k, s) {
+                Ok(out) => return Ok(out),
+                Err(e) => kernels::note_fallback("avg_pool2d", Some(&e)),
+            }
+        } else if native() {
+            kernels::note_fallback("avg_pool2d", None);
+        }
         let cpu = self.to_cpu_storage()?;
         let out = cpu.avg_pool2d(layout, k, s)?;
         self.device.storage_from_cpu_storage(&out)
     }
 
     fn max_pool2d(&self, layout: &Layout, k: (usize, usize), s: (usize, usize)) -> Result<Self> {
+        if native() && self.dtype == DType::F32 {
+            match self.pool2d_native(true, layout, k, s) {
+                Ok(out) => return Ok(out),
+                Err(e) => kernels::note_fallback("max_pool2d", Some(&e)),
+            }
+        } else if native() {
+            kernels::note_fallback("max_pool2d", None);
+        }
         let cpu = self.to_cpu_storage()?;
         let out = cpu.max_pool2d(layout, k, s)?;
         self.device.storage_from_cpu_storage(&out)
@@ -1784,6 +1810,14 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn upsample_nearest2d(&self, layout: &Layout, h: usize, w: usize) -> Result<Self> {
+        if native() && self.dtype == DType::F32 {
+            match self.upsample_nearest2d_native(layout, h, w) {
+                Ok(out) => return Ok(out),
+                Err(e) => kernels::note_fallback("upsample_nearest2d", Some(&e)),
+            }
+        } else if native() {
+            kernels::note_fallback("upsample_nearest2d", None);
+        }
         let cpu = self.to_cpu_storage()?;
         let out = cpu.upsample_nearest2d(layout, h, w)?;
         self.device.storage_from_cpu_storage(&out)
@@ -1807,6 +1841,159 @@ impl BackendStorage for VulkanStorage {
 // ─── Native op bodies ────────────────────────────────────────────────────────
 
 impl VulkanStorage {
+    /// conv2d as im2col + GEMM, the way the CUDA and ROCm backends run it.
+    /// The column matrix is built in chunks of whole output rows so the
+    /// scratch never exceeds [`kernels::IM2COL_CHUNK_BYTES`] (or the
+    /// device's binding limit); each chunk is `kernel (c_out, k) @ colᵀ
+    /// (k, rows * w_out)`, which lands directly in the (c_out, h, w) planes
+    /// of the output when the whole image fits in one chunk.
+    fn conv2d_native(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        p: &crate::conv::ParamsConv2D,
+    ) -> Result<Self> {
+        let (b, n) = (p.b_size, p.c_out);
+        let (h_out, w_out) = (p.out_h(), p.out_w());
+        let k = p.c_in * p.k_h * p.k_w;
+        let m = h_out * w_out;
+        if k == 0 {
+            return Err(Error::Msg("vulkan conv2d: empty contraction".into()));
+        }
+        let out = self.device.alloc(DType::F32, b * n * m)?;
+        if b * n * m == 0 {
+            return Ok(out);
+        }
+        let (kernel, k_off) = kernel.as_contiguous(kernel_l)?;
+        let lim = self.device.limits();
+        let cap = kernels::IM2COL_CHUNK_BYTES.min(lim.max_storage_range as usize);
+        let row_bytes = w_out * k * std::mem::size_of::<f32>();
+        let rows = if row_bytes == 0 {
+            h_out
+        } else {
+            (cap / row_bytes).clamp(1, h_out.max(1))
+        };
+        let col = self.device.alloc(DType::F32, rows * w_out * k)?;
+        // One chunk covering one image writes the output planes directly;
+        // otherwise each chunk lands in `res` and is copied into place.
+        let res = if b == 1 && rows >= h_out {
+            None
+        } else {
+            Some(self.device.alloc(DType::F32, n * rows * w_out)?)
+        };
+        for bi in 0..b {
+            let mut h0 = 0;
+            while h0 < h_out {
+                let r = rows.min(h_out - h0);
+                let cm = r * w_out;
+                let dst_base = (bi * h_out + h0) * w_out * k;
+                kernels::run_im2col(&self.device, self.buf(), col.buf(), cm * k, dst_base, l, p)?;
+                let sa = kernels::MatStrides {
+                    row: k,
+                    col: 1,
+                    offset: k_off,
+                    batch: 0,
+                };
+                // colᵀ: element (kk, j) of the (k, cm) operand is col[j * k + kk].
+                let sb = kernels::MatStrides {
+                    row: 1,
+                    col: k,
+                    offset: 0,
+                    batch: 0,
+                };
+                let target = res.as_ref().unwrap_or(&out);
+                kernels::run_matmul(
+                    &self.device,
+                    kernel.buf(),
+                    col.buf(),
+                    target.buf(),
+                    (1, n, cm, k),
+                    sa,
+                    sb,
+                )?;
+                if let Some(res) = &res {
+                    kernels::run_copy2d(
+                        &self.device,
+                        4,
+                        res.buf(),
+                        out.buf(),
+                        n,
+                        cm,
+                        cm,
+                        m,
+                        0,
+                        bi * n * m + h0 * w_out,
+                    )?;
+                }
+                h0 += r;
+            }
+        }
+        Ok(out)
+    }
+
+    fn conv_transpose2d_native(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        p: &crate::conv::ParamsConvTranspose2D,
+    ) -> Result<Self> {
+        let numel = p.b_size * p.c_out * p.out_h() * p.out_w();
+        let out = self.device.alloc(DType::F32, numel)?;
+        kernels::run_conv_transpose2d(
+            &self.device,
+            self.buf(),
+            kernel.buf(),
+            out.buf(),
+            l,
+            kernel_l,
+            p,
+        )?;
+        Ok(out)
+    }
+
+    fn pool2d_native(
+        &self,
+        max: bool,
+        l: &Layout,
+        (k_h, k_w): (usize, usize),
+        (s_h, s_w): (usize, usize),
+    ) -> Result<Self> {
+        let (b, c, h, w) = l.shape().dims4()?;
+        let (Some(dh), Some(dw)) = (h.checked_sub(k_h), w.checked_sub(k_w)) else {
+            return Err(Error::Msg(format!(
+                "vulkan pool2d: window ({k_h}, {k_w}) exceeds the input ({h}, {w})"
+            )));
+        };
+        if s_h == 0 || s_w == 0 || k_h == 0 || k_w == 0 {
+            return Err(Error::Msg("vulkan pool2d: zero window or stride".into()));
+        }
+        let (h_out, w_out) = (dh / s_h + 1, dw / s_w + 1);
+        let out = self.device.alloc(DType::F32, b * c * h_out * w_out)?;
+        kernels::run_pool2d(
+            &self.device,
+            max,
+            self.buf(),
+            out.buf(),
+            l,
+            (k_h, k_w),
+            (s_h, s_w),
+            (h_out, w_out),
+        )?;
+        Ok(out)
+    }
+
+    fn upsample_nearest2d_native(&self, l: &Layout, h_out: usize, w_out: usize) -> Result<Self> {
+        let (b, c, h_in, w_in) = l.shape().dims4()?;
+        if h_in == 0 || w_in == 0 {
+            return Err(Error::Msg("vulkan upsample_nearest2d: empty input".into()));
+        }
+        let out = self.device.alloc(DType::F32, b * c * h_out * w_out)?;
+        kernels::run_upsample_nearest2d(&self.device, self.buf(), out.buf(), l, (h_out, w_out))?;
+        Ok(out)
+    }
+
     fn reduce_native(&self, op: ReduceOp, layout: &Layout, s: &[usize]) -> Result<Option<Self>> {
         let dims = layout.dims();
         let rank = dims.len();
@@ -3632,6 +3819,130 @@ mod tests {
                 "quantized matmul k=96",
             );
         }
+        Ok(())
+    }
+
+    /// The conv / pool / upsample kernels against the CPU reference, on
+    /// contiguous and strided inputs and kernels.
+    #[test]
+    fn vulkan_conv_pool_upsample_match_cpu() -> crate::Result<()> {
+        let Some(dev) = device() else { return Ok(()) };
+        let cpu = Device::Cpu;
+        let before = kernels::native_exec_count();
+        let x = Tensor::arange(0f32, 990f32, &cpu)?
+            .reshape((2, 5, 9, 11))?
+            .affine(0.013, -0.9)?;
+        let xd = x.to_device(&dev)?;
+
+        // conv2d, 3x3 over 5 -> 4 channels at several paddings / strides /
+        // dilations, plus a 1x1 with a non-contiguous kernel, a depthwise
+        // (grouped) conv and a narrowed (strided) input.
+        let w = Tensor::arange(0f32, 180f32, &cpu)?
+            .reshape((4, 5, 3, 3))?
+            .affine(0.011, -0.3)?;
+        let wd = w.to_device(&dev)?;
+        for &(pad, stride, dil) in &[(1, 1, 1), (0, 1, 1), (1, 2, 1), (2, 1, 2), (0, 2, 2)] {
+            close(
+                &xd.conv2d(&wd, pad, stride, dil, 1)?,
+                &x.conv2d(&w, pad, stride, dil, 1)?,
+                1e-5,
+                &format!("conv2d pad {pad} stride {stride} dilation {dil}"),
+            );
+        }
+        let w1 = Tensor::arange(0f32, 20f32, &cpu)?
+            .reshape((5, 4, 1, 1))?
+            .affine(0.07, -0.2)?
+            .transpose(0, 1)?;
+        close(
+            &xd.conv2d(&w1.to_device(&dev)?, 0, 1, 1, 1)?,
+            &x.conv2d(&w1, 0, 1, 1, 1)?,
+            1e-5,
+            "conv2d 1x1 with a transposed kernel",
+        );
+        let wdw = Tensor::arange(0f32, 45f32, &cpu)?
+            .reshape((5, 1, 3, 3))?
+            .affine(0.02, -0.4)?;
+        close(
+            &xd.conv2d(&wdw.to_device(&dev)?, 1, 1, 1, 5)?,
+            &x.conv2d(&wdw, 1, 1, 1, 5)?,
+            1e-5,
+            "depthwise conv2d",
+        );
+        close(
+            &xd.narrow(3, 1, 8)?.conv2d(&wd, 1, 1, 1, 1)?,
+            &x.narrow(3, 1, 8)?.conv2d(&w, 1, 1, 1, 1)?,
+            1e-5,
+            "conv2d on a narrowed input",
+        );
+
+        // conv_transpose2d, 5 -> 3 channels.
+        let wt = Tensor::arange(0f32, 135f32, &cpu)?
+            .reshape((5, 3, 3, 3))?
+            .affine(0.017, -0.5)?;
+        let wtd = wt.to_device(&dev)?;
+        for &(pad, opad, stride, dil) in &[(0, 0, 1, 1), (1, 0, 2, 1), (1, 1, 2, 1), (0, 0, 1, 2)] {
+            close(
+                &xd.conv_transpose2d(&wtd, pad, opad, stride, dil)?,
+                &x.conv_transpose2d(&wt, pad, opad, stride, dil)?,
+                1e-5,
+                &format!(
+                    "conv_transpose2d pad {pad} out_pad {opad} stride {stride} dilation {dil}"
+                ),
+            );
+        }
+
+        // Pooling, with and without a stride that differs from the window.
+        close(
+            &xd.avg_pool2d((2, 2))?,
+            &x.avg_pool2d((2, 2))?,
+            1e-6,
+            "avg_pool2d 2x2",
+        );
+        close(
+            &xd.avg_pool2d_with_stride((3, 2), (1, 2))?,
+            &x.avg_pool2d_with_stride((3, 2), (1, 2))?,
+            1e-6,
+            "avg_pool2d 3x2 stride 1x2",
+        );
+        close(
+            &xd.max_pool2d((2, 2))?,
+            &x.max_pool2d((2, 2))?,
+            0.0,
+            "max_pool2d 2x2",
+        );
+        close(
+            &xd.max_pool2d_with_stride((3, 3), (2, 1))?,
+            &x.max_pool2d_with_stride((3, 3), (2, 1))?,
+            0.0,
+            "max_pool2d 3x3 stride 2x1",
+        );
+        close(
+            &xd.narrow(2, 1, 8)?.max_pool2d((2, 2))?,
+            &x.narrow(2, 1, 8)?.max_pool2d((2, 2))?,
+            0.0,
+            "max_pool2d on a narrowed input",
+        );
+
+        // Nearest upsampling: integer and non-integer ratios.
+        close(
+            &xd.upsample_nearest2d(18, 22)?,
+            &x.upsample_nearest2d(18, 22)?,
+            0.0,
+            "upsample_nearest2d 2x",
+        );
+        close(
+            &xd.upsample_nearest2d(13, 7)?,
+            &x.upsample_nearest2d(13, 7)?,
+            0.0,
+            "upsample_nearest2d 13x7",
+        );
+
+        let n = kernels::native_exec_count() - before;
+        assert!(
+            n >= 20,
+            "conv/pool/upsample: only {n} native kernel launches, {} fallbacks",
+            kernels::fallback_count()
+        );
         Ok(())
     }
 }

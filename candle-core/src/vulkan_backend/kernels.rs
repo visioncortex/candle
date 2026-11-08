@@ -2738,6 +2738,220 @@ pub fn run_qembed(
 /// Type alias for the pipeline cache map.
 pub type PipeMap = HashMap<String, std::sync::Arc<Pipe>>;
 
+// ─── Convolution, pooling, upsampling ─────────────────────────────────────────
+
+/// Bytes the conv2d im2col scratch may take per chunk (also capped by the
+/// device's `maxStorageBufferRange`); larger column matrices are built and
+/// multiplied in chunks of whole output rows.
+pub const IM2COL_CHUNK_BYTES: usize = 256 << 20;
+
+/// NCHW strides and start offset of a rank-4 layout, as the `i32`s the
+/// kernels take.
+fn nchw(l: &Layout) -> Result<([i32; 4], i32)> {
+    let st = l.stride();
+    if st.len() != 4 {
+        return Err(Error::Msg(format!(
+            "vulkan: expected a rank-4 layout, got rank {}",
+            st.len()
+        )));
+    }
+    Ok((
+        [
+            to_i32(st[0])?,
+            to_i32(st[1])?,
+            to_i32(st[2])?,
+            to_i32(st[3])?,
+        ],
+        to_i32(l.start_offset())?,
+    ))
+}
+
+/// `col[0..n)` = elements `[dst_base, dst_base + n)` of the
+/// (b, h_out, w_out, c_in * k_h * k_w) column matrix of `src` (layout `l`).
+pub fn run_im2col(
+    d: &VulkanDevice,
+    src: Buf,
+    col: Buf,
+    n: usize,
+    dst_base: usize,
+    l: &Layout,
+    p: &crate::conv::ParamsConv2D,
+) -> Result<()> {
+    if n == 0 {
+        return Ok(());
+    }
+    let (s, off) = nchw(l)?;
+    let push = Push::default()
+        .us(n)?
+        .us(dst_base)?
+        .us(p.out_h())?
+        .us(p.out_w())?
+        .us(p.k_h)?
+        .us(p.k_w)?
+        .us(p.stride)?
+        .us(p.padding)?
+        .us(p.dilation)?
+        .us(p.c_in)?
+        .us(p.i_h)?
+        .us(p.i_w)?
+        .i(s[0])
+        .i(s[1])
+        .i(s[2])
+        .i(s[3])
+        .i(off);
+    let lim = d.limits();
+    d.launch(
+        "im2col_f32",
+        glsl::k_im2col,
+        &[src, col],
+        push,
+        &[],
+        grid(n, lim.wg, 1, lim.max_groups_x),
+    )
+}
+
+/// Direct transposed convolution into the contiguous (b, c_out, h_out, w_out)
+/// `out`; `src` is (b, c_in, h_in, w_in) under `l`, `kernel` is
+/// (c_in, c_out, k_h, k_w) under `k_l`.
+pub fn run_conv_transpose2d(
+    d: &VulkanDevice,
+    src: Buf,
+    kernel: Buf,
+    out: Buf,
+    l: &Layout,
+    k_l: &Layout,
+    p: &crate::conv::ParamsConvTranspose2D,
+) -> Result<()> {
+    let (h_out, w_out) = (p.out_h(), p.out_w());
+    let n = p.b_size * p.c_out * h_out * w_out;
+    if n == 0 {
+        return Ok(());
+    }
+    let (s, off) = nchw(l)?;
+    let (ks, k_off) = nchw(k_l)?;
+    let push = Push::default()
+        .us(n)?
+        .us(h_out)?
+        .us(w_out)?
+        .us(p.stride)?
+        .us(p.padding)?
+        .us(p.dilation)?
+        .us(p.c_in)?
+        .us(p.c_out)?
+        .us(p.i_h)?
+        .us(p.i_w)?
+        .us(p.k_h)?
+        .us(p.k_w)?
+        .i(s[0])
+        .i(s[1])
+        .i(s[2])
+        .i(s[3])
+        .i(off)
+        .i(ks[0])
+        .i(ks[1])
+        .i(ks[2])
+        .i(ks[3])
+        .i(k_off);
+    let lim = d.limits();
+    d.launch(
+        "conv_transpose2d_f32",
+        glsl::k_conv_transpose2d,
+        &[src, kernel, out],
+        push,
+        &[],
+        grid(n, lim.wg, 1, lim.max_groups_x),
+    )
+}
+
+/// avg (`max == false`) or max pooling of the (b, c, h_in, w_in) `src`
+/// into the contiguous (b, c, h_out, w_out) `out`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_pool2d(
+    d: &VulkanDevice,
+    max: bool,
+    src: Buf,
+    out: Buf,
+    l: &Layout,
+    (k_h, k_w): (usize, usize),
+    (s_h, s_w): (usize, usize),
+    (h_out, w_out): (usize, usize),
+) -> Result<()> {
+    let (b, c, h_in, w_in) = l.shape().dims4()?;
+    let n = b * c * h_out * w_out;
+    if n == 0 {
+        return Ok(());
+    }
+    let (s, off) = nchw(l)?;
+    let push = Push::default()
+        .us(n)?
+        .us(k_h)?
+        .us(k_w)?
+        .us(s_h)?
+        .us(s_w)?
+        .us(c)?
+        .us(h_in)?
+        .us(w_in)?
+        .us(h_out)?
+        .us(w_out)?
+        .i(s[0])
+        .i(s[1])
+        .i(s[2])
+        .i(s[3])
+        .i(off);
+    let lim = d.limits();
+    let key = if max {
+        "max_pool2d_f32"
+    } else {
+        "avg_pool2d_f32"
+    };
+    d.launch(
+        key,
+        |wg| glsl::k_pool2d(wg, max),
+        &[src, out],
+        push,
+        &[],
+        grid(n, lim.wg, 1, lim.max_groups_x),
+    )
+}
+
+/// Nearest-neighbour upsample of the (b, c, h_in, w_in) `src` into the
+/// contiguous (b, c, h_out, w_out) `out`.
+pub fn run_upsample_nearest2d(
+    d: &VulkanDevice,
+    src: Buf,
+    out: Buf,
+    l: &Layout,
+    (h_out, w_out): (usize, usize),
+) -> Result<()> {
+    let (b, c, h_in, w_in) = l.shape().dims4()?;
+    let n = b * c * h_out * w_out;
+    if n == 0 || h_in == 0 || w_in == 0 {
+        return Ok(());
+    }
+    let (s, off) = nchw(l)?;
+    let push = Push::default()
+        .us(n)?
+        .us(c)?
+        .us(h_in)?
+        .us(w_in)?
+        .us(h_out)?
+        .us(w_out)?
+        .i(s[0])
+        .i(s[1])
+        .i(s[2])
+        .i(s[3])
+        .i(off);
+    let lim = d.limits();
+    d.launch(
+        "upsample_nearest2d_f32",
+        glsl::k_upsample_nearest2d,
+        &[src, out],
+        push,
+        &[],
+        grid(n, lim.wg, 1, lim.max_groups_x),
+    )
+}
+
 #[cfg(test)]
 mod barrier_tests {
     use super::{glsl, glsl_to_spirv};
