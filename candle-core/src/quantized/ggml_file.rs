@@ -132,6 +132,16 @@ fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
         Device::Cuda(cuda) => super::cuda::load_quantized(cuda, data)?,
         #[cfg(feature = "rocm")]
         Device::Rocm(rocm) => super::rocm::load_quantized(rocm, data)?,
+        Device::Vulkan(d) => {
+            // Blocks go to the device as-is; the kernels dequantize in place.
+            let n = data.len() * T::BLCK_SIZE;
+            QStorage::Vulkan(crate::QVulkanStorage::from_bytes(
+                d,
+                T::DTYPE,
+                n,
+                &raw_data[..size_in_bytes],
+            )?)
+        }
     };
     super::QTensor::new(data, dims)
 }

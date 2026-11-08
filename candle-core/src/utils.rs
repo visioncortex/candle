@@ -607,6 +607,9 @@ pub fn metal_is_available() -> bool {
 pub fn rocm_is_available() -> bool {
     cfg!(feature = "rocm")
 }
+pub fn vulkan_is_available() -> bool {
+    cfg!(feature = "vulkan")
+}
 
 pub fn with_avx() -> bool {
     crate::cpu::features::get().avx2

@@ -680,6 +680,7 @@ impl Tensor {
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             #[cfg(feature = "rocm")]
             Storage::Rocm(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Vulkan(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
 
@@ -1986,6 +1987,7 @@ impl Tensor {
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             #[cfg(feature = "rocm")]
             Storage::Rocm(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Vulkan(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
 
@@ -2019,6 +2021,7 @@ impl Tensor {
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             #[cfg(feature = "rocm")]
             Storage::Rocm(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Vulkan(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
 
@@ -2062,6 +2065,7 @@ impl Tensor {
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             #[cfg(feature = "rocm")]
             Storage::Rocm(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Vulkan(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
 
@@ -2426,6 +2430,14 @@ impl Tensor {
                 (Storage::Metal(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
                 #[cfg(feature = "rocm")]
                 (Storage::Rocm(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
+                (Storage::Cpu(storage), Device::Vulkan(vk)) => {
+                    Storage::Vulkan(vk.storage_from_cpu_storage(storage)?)
+                }
+                (Storage::Vulkan(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
+                (Storage::Vulkan(storage), Device::Vulkan(vk)) => {
+                    let dst = storage.transfer_to_device(vk)?;
+                    Storage::Vulkan(dst)
+                }
                 (Storage::Cuda(storage), Device::Cuda(cuda)) => {
                     // can't clone storage if it's the same device because of the underlying device ptr
                     let dst_storage = storage.transfer_to_device(cuda)?;
