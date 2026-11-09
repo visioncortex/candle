@@ -102,6 +102,14 @@
   through ROCm and 26 s on 16 CPU cores, with the output within 1 LSB of
   the CPU's. `cargo run --release -p candle-core --features vulkan
   --example conv_bench -- vulkan` times the building blocks per device.
+- Discrete cards with Resizable BAR, and APUs whose unified memory is not
+  host-cached: host reads of the tensor mapping run at ~0.1 GB/s, so
+  downloads are copied by the GPU into a host-cached staging buffer first
+  (7× faster on Strix Halo; a host-cached unified type is preferred where a
+  driver offers one, as Intel's does). `vulkan_backend::best_adapter()`
+  ranks adapters for a caller without a preference: a Resizable-BAR card,
+  then an integrated GPU, never a software device; `vk_memtypes` prints the
+  heaps and types behind the choice.
 - A discrete card without Resizable BAR exposes only its 256 MB BAR window
   as host-visible device memory; since every tensor is mapped, the device is
   refused at bind (a caller's Auto falls back to the CPU) unless

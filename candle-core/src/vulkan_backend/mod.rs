@@ -53,6 +53,11 @@ pub struct Limits {
     /// Whether tensor memory is device-local as well as host-visible
     /// (unified memory: an iGPU or a software device).
     pub host_unified: bool,
+    /// Whether tensor memory is host-cached. Where it is not (a discrete
+    /// card's VRAM through Resizable BAR, an APU's uncached carve-out), host
+    /// reads of the mapping run at a fraction of a GB/s and downloads go
+    /// through a cached staging buffer instead.
+    pub host_cached: bool,
     /// The quantized-GEMV kernel for this device ([`kernels::Qgemv`]).
     pub qgemv: kernels::Qgemv,
     /// Whether the `shaderIntegerDotProduct` feature is enabled (packed
@@ -337,6 +342,8 @@ struct VulkanContext {
     /// (`CANDLE_VULKAN_SYSTEM_MEMORY=1`) real device-local VRAM, so the
     /// column matrix never crosses PCIe.
     scratch_mem: Mutex<Allocator>,
+    /// Host-cached buffers the GPU copies into for downloads (pool 2).
+    staging_mem: Mutex<Allocator>,
     // Lock order: quant_gemm_scratch -> exec -> mem. Hold this guard through
     // both dispatches so concurrent requests cannot overwrite another GEMM's
     // weights between dequantization and use.
@@ -391,7 +398,7 @@ impl Drop for VulkanContext {
                 self.device.destroy_pipeline_layout(l.layout, None);
                 self.device.destroy_descriptor_set_layout(l.dsl, None);
             }
-            for pool in [&self.mem, &self.scratch_mem] {
+            for pool in [&self.mem, &self.scratch_mem, &self.staging_mem] {
                 let mut mem = pool.lock().unwrap_or_else(|p| p.into_inner());
                 for b in mem.blocks.drain(..).flatten() {
                     if !b.mapped.is_null() {
@@ -477,6 +484,10 @@ pub struct VulkanAdapterInfo {
     /// Whether some memory type is device-local and host-visible (unified
     /// memory, as on an APU such as the BC-250).
     pub unified_memory: bool,
+    /// Size of the heap behind that memory type: all of memory on an APU or
+    /// a Resizable-BAR card, the 256 MB BAR window on a discrete card
+    /// without it, 0 when there is none.
+    pub unified_heap_bytes: u64,
     /// Whether the device supports `shaderFloat64`.
     pub shader_float64: bool,
     /// Whether the device offers `VK_KHR_shader_integer_dot_product`.
@@ -531,10 +542,17 @@ fn adapter_info(
         .filter(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
         .map(|h| h.size)
         .sum();
-    let unified_memory = types.iter().any(|t| {
-        t.property_flags
-            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE)
-    });
+    let unified_heap_bytes = types
+        .iter()
+        .filter(|t| {
+            t.property_flags.contains(
+                vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE,
+            )
+        })
+        .map(|t| heaps[t.heap_index as usize].size)
+        .max()
+        .unwrap_or(0);
+    let unified_memory = unified_heap_bytes > 0;
     let features = unsafe { instance.get_physical_device_features(physical) };
     let integer_dot_product = unsafe { instance.enumerate_device_extension_properties(physical) }
         .unwrap_or_default()
@@ -565,9 +583,34 @@ fn adapter_info(
         ),
         device_local_bytes,
         unified_memory,
+        unified_heap_bytes,
         shader_float64: features.shader_float64 == vk::TRUE,
         integer_dot_product,
     }
+}
+
+/// The adapter a caller with no preference should open, if any: a discrete
+/// card whose VRAM is host-visible (Resizable BAR) first, then an integrated
+/// GPU, then a discrete card with only a BAR window (which `new` refuses
+/// unless `CANDLE_VULKAN_SYSTEM_MEMORY=1`); software devices never. Among
+/// equals, the most device memory. `None` when there is no GPU.
+pub fn best_adapter() -> Result<Option<usize>> {
+    let mut adapters: Vec<VulkanAdapterInfo> = enumerate_adapters()?
+        .into_iter()
+        .filter(|a| !a.is_software() || allow_software_adapter())
+        .collect();
+    let rank = |a: &VulkanAdapterInfo| match a.device_type {
+        "discrete" if a.unified_heap_bytes >= SMALL_HEAP_BYTES => 0,
+        "integrated" => 1,
+        "discrete" => 2,
+        _ => 3,
+    };
+    adapters.sort_by(|a, b| {
+        rank(a)
+            .cmp(&rank(b))
+            .then(b.device_local_bytes.cmp(&a.device_local_bytes))
+    });
+    Ok(adapters.first().map(|a| a.index))
 }
 
 /// Whether software Vulkan implementations (lavapipe) may be opened as a
@@ -764,7 +807,12 @@ fn init_vulkan(gpu_id: usize, qgemv: Option<kernels::Qgemv>) -> Result<VulkanDev
     let heap_bytes = |t: u32| {
         mem_props.memory_heaps[mem_props.memory_types[t as usize].heap_index as usize].size
     };
-    let (mem_type, host_unified) = match pick(hv | vk::MemoryPropertyFlags::DEVICE_LOCAL) {
+    let cached = vk::MemoryPropertyFlags::HOST_CACHED;
+    // A host-cached unified type (Intel iGPUs offer one) reads back at
+    // memory speed; otherwise downloads go through a cached staging buffer.
+    let unified = pick(hv | cached | vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        .or_else(|| pick(hv | vk::MemoryPropertyFlags::DEVICE_LOCAL));
+    let (mem_type, host_unified) = match unified {
         // Unified memory (an iGPU, or a discrete card with Resizable BAR):
         // every tensor lives in device memory the host can map.
         Some(i) if heap_bytes(i) >= SMALL_HEAP_BYTES => (i, true),
@@ -782,7 +830,7 @@ fn init_vulkan(gpu_id: usize, qgemv: Option<kernels::Qgemv>) -> Result<VulkanDev
                 heap_bytes(i) >> 20
             )
         }
-        _ => match pick(hv) {
+        _ => match pick(hv | cached).or_else(|| pick(hv)) {
             Some(i) => (i, false),
             None => {
                 unsafe { device.destroy_device(None) };
@@ -790,6 +838,12 @@ fn init_vulkan(gpu_id: usize, qgemv: Option<kernels::Qgemv>) -> Result<VulkanDev
             }
         },
     };
+    let host_cached = mem_props.memory_types[mem_type as usize]
+        .property_flags
+        .contains(cached);
+    // Downloads from uncached tensor memory are copied by the GPU into a
+    // host-cached buffer first.
+    let staging_mem_type = pick(hv | cached).unwrap_or(mem_type);
     let scratch_mem_type = if host_unified {
         mem_type
     } else {
@@ -807,6 +861,7 @@ fn init_vulkan(gpu_id: usize, qgemv: Option<kernels::Qgemv>) -> Result<VulkanDev
         max_storage_range: lim.max_storage_buffer_range as u64,
         max_groups_x: lim.max_compute_work_group_count[0].max(1),
         host_unified,
+        host_cached,
         qgemv: qgemv.unwrap_or_else(|| {
             kernels::Qgemv::for_adapter(props.vendor_id, props.device_id, int_dot)
         }),
@@ -847,6 +902,14 @@ fn init_vulkan(gpu_id: usize, qgemv: Option<kernels::Qgemv>) -> Result<VulkanDev
                 mem_type: scratch_mem_type,
                 mapped: scratch_mem_type == mem_type,
                 pool: 1,
+            }),
+            staging_mem: Mutex::new(Allocator {
+                blocks: Vec::new(),
+                chunk: CHUNK_BYTES,
+                cache_limit: cache_limit_bytes() / 4,
+                mem_type: staging_mem_type,
+                mapped: true,
+                pool: 2,
             }),
             quant_gemm_scratch: Mutex::new(None),
             conv_scratch: Mutex::new([None, None]),
@@ -1042,10 +1105,14 @@ impl VulkanDevice {
 
     /// The allocator an allocation came from.
     fn pool(&self, alloc: &Alloc) -> &Mutex<Allocator> {
-        if alloc.pool == 1 {
-            &self.inner.scratch_mem
-        } else {
-            &self.inner.mem
+        self.pool_by_index(alloc.pool)
+    }
+
+    fn pool_by_index(&self, pool: u8) -> &Mutex<Allocator> {
+        match pool {
+            1 => &self.inner.scratch_mem,
+            2 => &self.inner.staging_mem,
+            _ => &self.inner.mem,
         }
     }
 
@@ -1086,7 +1153,7 @@ impl VulkanDevice {
             .checked_mul(numel)
             .ok_or_else(|| Error::Msg("vulkan: overflow in storage size".into()))?;
         let capacity = bytes.div_ceil(4).max(1) * 4;
-        let (buffer, alloc, mapped) = self.alloc_raw(capacity as u64, false)?;
+        let (buffer, alloc, mapped) = self.alloc_raw(capacity as u64, 0)?;
         Ok(VulkanStorage {
             buffer,
             alloc,
@@ -1098,8 +1165,9 @@ impl VulkanDevice {
         })
     }
 
-    /// `scratch`: from the scratch allocator (memory the host never reads).
-    fn alloc_raw(&self, capacity: u64, scratch: bool) -> Result<(vk::Buffer, Alloc, *mut u8)> {
+    /// `pool`: 0 tensors, 1 scratch (memory the host never reads), 2
+    /// staging (host-cached, for downloads).
+    fn alloc_raw(&self, capacity: u64, pool: u8) -> Result<(vk::Buffer, Alloc, *mut u8)> {
         let dev = &self.inner.device;
         let buffer = unsafe {
             dev.create_buffer(
@@ -1112,12 +1180,10 @@ impl VulkanDevice {
         }
         .map_err(|e| Error::Msg(format!("vulkan create_buffer failed: {e:?}")))?;
         let req = unsafe { dev.get_buffer_memory_requirements(buffer) };
-        let pool = if scratch {
-            &self.inner.scratch_mem
-        } else {
-            &self.inner.mem
-        };
-        let mut mem = pool.lock().unwrap_or_else(|p| p.into_inner());
+        let mut mem = self
+            .pool_by_index(pool)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if req.memory_type_bits & (1 << mem.mem_type) == 0 {
             unsafe { dev.destroy_buffer(buffer, None) };
             return Err(Error::Msg(format!(
@@ -1233,12 +1299,39 @@ impl VulkanStorage {
     }
 
     /// Read `bytes` from the buffer after completing the pending batch.
+    ///
+    /// Tensor memory that is not host-cached (VRAM through Resizable BAR,
+    /// an APU's carve-out) reads back at ~0.1 GB/s through its mapping, so
+    /// the GPU first copies the range into a host-cached staging buffer.
     pub(crate) fn get_bytes(&self, bytes: usize) -> Result<Vec<u8>> {
-        self.device.flush()?;
-        self.device.check_fault()?;
         let n = bytes.min(self.capacity_bytes);
         let mut out = vec![0u8; n];
-        unsafe { std::ptr::copy_nonoverlapping(self.mapped, out.as_mut_ptr(), n) };
+        if self.device.limits().host_cached || n == 0 {
+            self.device.flush()?;
+            self.device.check_fault()?;
+            unsafe { std::ptr::copy_nonoverlapping(self.mapped, out.as_mut_ptr(), n) };
+        } else {
+            let (buffer, alloc, mapped) = self.device.alloc_raw(n as u64, 2)?;
+            let copied = {
+                let mut exec = self.device.exec();
+                exec.record_copy(
+                    self.buf(),
+                    Buf {
+                        buffer,
+                        bytes: n as u64,
+                    },
+                    n as u64,
+                )
+            };
+            let result = copied
+                .and_then(|_| self.device.flush())
+                .and_then(|_| self.device.check_fault());
+            if result.is_ok() {
+                unsafe { std::ptr::copy_nonoverlapping(mapped, out.as_mut_ptr(), n) };
+            }
+            self.device.release(buffer, alloc);
+            result?;
+        }
         kernels::note_d2h(n);
         Ok(out)
     }
@@ -2016,7 +2109,7 @@ impl BackendStorage for VulkanStorage {
 fn scratch_buf(dev: &VulkanDevice, slot: &mut Option<QuantGemmScratch>, bytes: u64) -> Result<Buf> {
     let bytes = bytes.max(4);
     if slot.as_ref().is_none_or(|s| s.capacity < bytes) {
-        let (buffer, alloc, _) = dev.alloc_raw(bytes, true)?;
+        let (buffer, alloc, _) = dev.alloc_raw(bytes, 1)?;
         if let Some(old) = slot.replace(QuantGemmScratch {
             buffer,
             alloc,
@@ -2917,7 +3010,7 @@ impl QVulkanStorage {
                 // submission in the recorder, after complete dispatch recording.
                 dev.exec().batch_limit = kernels::PREFILL_MAX_LAUNCHES;
                 if scratch.as_ref().is_none_or(|s| s.capacity < bytes) {
-                    let (buffer, alloc, _) = dev.alloc_raw(bytes, false)?;
+                    let (buffer, alloc, _) = dev.alloc_raw(bytes, 0)?;
                     if let Some(old) = scratch.replace(QuantGemmScratch {
                         buffer,
                         alloc,

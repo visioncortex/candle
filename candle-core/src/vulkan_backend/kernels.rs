@@ -804,6 +804,44 @@ impl Exec {
 }
 
 impl Exec {
+    /// Record a buffer-to-buffer copy of `bytes` from the start of `src` to
+    /// the start of `dst`, ordered after the batch's compute so far and
+    /// before the host reads `dst`. Returns whether the batch is full.
+    pub(super) fn record_copy(&mut self, src: Buf, dst: Buf, bytes: u64) -> Result<bool> {
+        self.begin()?;
+        let dev = &self.device;
+        unsafe {
+            let before = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
+            dev.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &before,
+                &[],
+                &[],
+            );
+            let region = [vk::BufferCopy::default().size(bytes)];
+            dev.cmd_copy_buffer(self.cmd, src.buffer, dst.buffer, &region);
+            let after = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::SHADER_READ)];
+            dev.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &after,
+                &[],
+                &[],
+            );
+        }
+        self.launches += 1;
+        Ok(self.launches >= self.batch_limit)
+    }
+
     /// The fault word as a kernel argument.
     pub(super) fn fault(&self) -> Buf {
         Buf {

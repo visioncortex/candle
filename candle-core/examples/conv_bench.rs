@@ -83,6 +83,24 @@ fn main() -> Result<()> {
         }
     }
 
+    // Host <-> device transfer of a 64 MB f32 tensor (an output tile is 4 MB;
+    // on a discrete card the mapping is uncached for host reads).
+    let host: Vec<f32> = (0..16 << 20).map(|i| i as f32).collect();
+    let t0 = Instant::now();
+    let up = Tensor::from_vec(host.clone(), 16 << 20, &dev)?;
+    sync(&dev)?;
+    let up_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let t0 = Instant::now();
+    let back: Vec<f32> = up.to_vec1()?;
+    let down_ms = t0.elapsed().as_secs_f64() * 1e3;
+    assert_eq!(back[12345], 12345.0);
+    println!(
+        "transfer 64 MB: upload {:.1} ms ({:.1} GB/s), download {:.1} ms ({:.1} GB/s)",
+        up_ms,
+        0.064 / (up_ms / 1e3),
+        down_ms,
+        0.064 / (down_ms / 1e3)
+    );
     println!("{:<34} {:>10} {:>10}", "op", "ms/call", "GFLOP/s");
     for &(ci, co, h, w) in &shapes {
         let x = Tensor::randn(0f32, 1., (1, ci, h, w), &dev)?;
