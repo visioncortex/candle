@@ -102,6 +102,13 @@
   through ROCm and 26 s on 16 CPU cores, with the output within 1 LSB of
   the CPU's. `cargo run --release -p candle-core --features vulkan
   --example conv_bench -- vulkan` times the building blocks per device.
+- A discrete card without Resizable BAR exposes only its 256 MB BAR window
+  as host-visible device memory; since every tensor is mapped, the device is
+  refused at bind (a caller's Auto falls back to the CPU) unless
+  `CANDLE_VULKAN_SYSTEM_MEMORY=1` asks to run from system memory over PCIe.
+  Measured on a GeForce MX150: refused → CPU 4.2 s for a pass that takes
+  14.5 s from system memory. Weak iGPUs (Intel UHD 620) run correctly but no
+  faster than their CPU; pick the device per machine.
 
 [![discord server](https://dcbadge.limes.pink/api/server/hugging-face-879548962464493619)](https://discord.gg/hugging-face-879548962464493619)
 [![Latest version](https://img.shields.io/crates/v/candle-core.svg)](https://crates.io/crates/candle-core)

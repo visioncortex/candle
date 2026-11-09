@@ -552,6 +552,17 @@ fn allow_software_adapter() -> bool {
     std::env::var("CANDLE_VULKAN_ALLOW_CPU").is_ok_and(|v| v == "1")
 }
 
+/// Below this, a device-local host-visible heap is taken to be the PCIe BAR
+/// window of a discrete card without Resizable BAR (256 MB), not memory a
+/// tensor can live in.
+const SMALL_HEAP_BYTES: u64 = 1 << 30;
+
+/// `CANDLE_VULKAN_SYSTEM_MEMORY=1`: on such a card, run from host memory
+/// (the GPU reads every buffer over PCIe) instead of refusing the device.
+fn allow_system_memory() -> bool {
+    std::env::var("CANDLE_VULKAN_SYSTEM_MEMORY").is_ok_and(|v| v == "1")
+}
+
 /// Lists the Vulkan physical devices visible through the loader, in ordinal
 /// order. Fails when no Vulkan loader can be loaded.
 pub fn enumerate_adapters() -> Result<Vec<VulkanAdapterInfo>> {
@@ -725,9 +736,28 @@ fn init_vulkan(gpu_id: usize, qgemv: Option<kernels::Qgemv>) -> Result<VulkanDev
             .map(|(i, _)| i as u32)
     };
     let hv = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    let heap_bytes = |t: u32| {
+        mem_props.memory_heaps[mem_props.memory_types[t as usize].heap_index as usize].size
+    };
     let (mem_type, host_unified) = match pick(hv | vk::MemoryPropertyFlags::DEVICE_LOCAL) {
-        Some(i) => (i, true),
-        None => match pick(hv) {
+        // Unified memory (an iGPU, or a discrete card with Resizable BAR):
+        // every tensor lives in device memory the host can map.
+        Some(i) if heap_bytes(i) >= SMALL_HEAP_BYTES => (i, true),
+        // A discrete card without Resizable BAR: the only host-visible device
+        // memory is the BAR window, which the first allocations exhaust. The
+        // backend maps every tensor, so it cannot use such a card well;
+        // refuse it (so a caller's Auto falls back to the CPU) unless asked to
+        // run from system memory.
+        Some(i) if !allow_system_memory() => {
+            unsafe { device.destroy_device(None) };
+            fail!(
+                "vulkan: {name}'s host-visible device memory is a {} MB window (a discrete GPU \
+                 without Resizable BAR), too small to hold tensors; enable Resizable BAR, or set \
+                 CANDLE_VULKAN_SYSTEM_MEMORY=1 to run from system memory over PCIe",
+                heap_bytes(i) >> 20
+            )
+        }
+        _ => match pick(hv) {
             Some(i) => (i, false),
             None => {
                 unsafe { device.destroy_device(None) };
