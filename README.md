@@ -105,10 +105,12 @@
 - A discrete card without Resizable BAR exposes only its 256 MB BAR window
   as host-visible device memory; since every tensor is mapped, the device is
   refused at bind (a caller's Auto falls back to the CPU) unless
-  `CANDLE_VULKAN_SYSTEM_MEMORY=1` asks to run from system memory over PCIe.
-  Measured on a GeForce MX150: refused → CPU 4.2 s for a pass that takes
-  14.5 s from system memory. Weak iGPUs (Intel UHD 620) run correctly but no
-  faster than their CPU; pick the device per machine.
+  `CANDLE_VULKAN_SYSTEM_MEMORY=1` asks to run from system memory over PCIe
+  (the conv im2col scratch then lives in real VRAM; tensors do not).
+  Measured on a GeForce MX150 (PCIe 3 x4): two passes take 45 s from system
+  memory against 18.7 s on its CPU, so the refusal stays the default. Weak
+  iGPUs (Intel UHD 620) run correctly but no faster than their CPU; pick the
+  device per machine.
 
 [![discord server](https://dcbadge.limes.pink/api/server/hugging-face-879548962464493619)](https://discord.gg/hugging-face-879548962464493619)
 [![Latest version](https://img.shields.io/crates/v/candle-core.svg)](https://crates.io/crates/candle-core)

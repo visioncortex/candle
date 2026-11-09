@@ -68,6 +68,8 @@ pub struct Alloc {
     block: usize,
     offset: u64,
     size: u64,
+    /// Which allocator owns the block: 0 = tensors, 1 = scratch.
+    pool: u8,
 }
 
 struct Block {
@@ -87,8 +89,13 @@ struct Allocator {
     chunk: u64,
     mem_type: u32,
     /// Bytes of empty dedicated blocks kept for reuse (see
-    /// [`Allocator::trim_dedicated_cache`]).
+    /// [`Allocator::trim_cache`]).
     cache_limit: u64,
+    /// Whether the memory type is host-visible (blocks are mapped). The
+    /// scratch allocator of a card running from system memory is not.
+    mapped: bool,
+    /// Index of this allocator in the device (see [`Alloc::pool`]).
+    pool: u8,
 }
 
 /// Default block size; requests above a quarter of it get a dedicated block.
@@ -146,6 +153,7 @@ impl Allocator {
                             block: bi,
                             offset: start,
                             size,
+                            pool: self.pool,
                         },
                         ptr,
                     ));
@@ -180,6 +188,7 @@ impl Allocator {
                         block: bi,
                         offset: 0,
                         size,
+                        pool: self.pool,
                     },
                     b.mapped,
                 ));
@@ -199,13 +208,17 @@ impl Allocator {
                 "vulkan allocate_memory({bsize} bytes) failed: {e:?}"
             ))
         })?;
-        let mapped = match unsafe {
-            device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-        } {
-            Ok(p) => p as *mut u8,
-            Err(e) => {
-                unsafe { device.free_memory(memory, None) };
-                return Err(Error::Msg(format!("vulkan map_memory failed: {e:?}")));
+        let mapped = if !self.mapped {
+            std::ptr::null_mut()
+        } else {
+            match unsafe {
+                device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+            } {
+                Ok(p) => p as *mut u8,
+                Err(e) => {
+                    unsafe { device.free_memory(memory, None) };
+                    return Err(Error::Msg(format!("vulkan map_memory failed: {e:?}")));
+                }
             }
         };
         let free = if bsize > size {
@@ -235,6 +248,7 @@ impl Allocator {
                 block: bi,
                 offset: 0,
                 size,
+                pool: self.pool,
             },
             mapped,
         ))
@@ -283,7 +297,9 @@ impl Allocator {
             let Some((bi, _)) = largest else { return };
             let b = self.blocks[bi].take().unwrap();
             unsafe {
-                device.unmap_memory(b.memory);
+                if !b.mapped.is_null() {
+                    device.unmap_memory(b.memory);
+                }
                 device.free_memory(b.memory, None);
             }
         }
@@ -316,6 +332,11 @@ struct VulkanContext {
     limits: Limits,
     buffer_align: u64,
     mem: Mutex<Allocator>,
+    /// Scratch the host never reads (conv im2col). In unified memory the
+    /// same type as `mem`; on a card running from system memory
+    /// (`CANDLE_VULKAN_SYSTEM_MEMORY=1`) real device-local VRAM, so the
+    /// column matrix never crosses PCIe.
+    scratch_mem: Mutex<Allocator>,
     // Lock order: quant_gemm_scratch -> exec -> mem. Hold this guard through
     // both dispatches so concurrent requests cannot overwrite another GEMM's
     // weights between dequantization and use.
@@ -370,10 +391,14 @@ impl Drop for VulkanContext {
                 self.device.destroy_pipeline_layout(l.layout, None);
                 self.device.destroy_descriptor_set_layout(l.dsl, None);
             }
-            let mut mem = self.mem.lock().unwrap_or_else(|p| p.into_inner());
-            for b in mem.blocks.drain(..).flatten() {
-                self.device.unmap_memory(b.memory);
-                self.device.free_memory(b.memory, None);
+            for pool in [&self.mem, &self.scratch_mem] {
+                let mut mem = pool.lock().unwrap_or_else(|p| p.into_inner());
+                for b in mem.blocks.drain(..).flatten() {
+                    if !b.mapped.is_null() {
+                        self.device.unmap_memory(b.memory);
+                    }
+                    self.device.free_memory(b.memory, None);
+                }
             }
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
@@ -765,6 +790,11 @@ fn init_vulkan(gpu_id: usize, qgemv: Option<kernels::Qgemv>) -> Result<VulkanDev
             }
         },
     };
+    let scratch_mem_type = if host_unified {
+        mem_type
+    } else {
+        pick(vk::MemoryPropertyFlags::DEVICE_LOCAL).unwrap_or(mem_type)
+    };
     let lim = &props.limits;
     let max_inv = lim.max_compute_work_group_invocations.max(64) as usize;
     let mut wg = 1usize;
@@ -807,6 +837,16 @@ fn init_vulkan(gpu_id: usize, qgemv: Option<kernels::Qgemv>) -> Result<VulkanDev
                 chunk: CHUNK_BYTES,
                 cache_limit: cache_limit_bytes(),
                 mem_type,
+                mapped: true,
+                pool: 0,
+            }),
+            scratch_mem: Mutex::new(Allocator {
+                blocks: Vec::new(),
+                chunk: CHUNK_BYTES,
+                cache_limit: cache_limit_bytes(),
+                mem_type: scratch_mem_type,
+                mapped: scratch_mem_type == mem_type,
+                pool: 1,
             }),
             quant_gemm_scratch: Mutex::new(None),
             conv_scratch: Mutex::new([None, None]),
@@ -1000,13 +1040,25 @@ impl VulkanDevice {
         Ok(())
     }
 
+    /// The allocator an allocation came from.
+    fn pool(&self, alloc: &Alloc) -> &Mutex<Allocator> {
+        if alloc.pool == 1 {
+            &self.inner.scratch_mem
+        } else {
+            &self.inner.mem
+        }
+    }
+
     pub(crate) fn free_garbage(&self, garbage: Vec<kernels::Garbage>) {
         if garbage.is_empty() {
             return;
         }
-        let mut mem = self.inner.mem.lock().unwrap_or_else(|p| p.into_inner());
         for g in garbage {
             unsafe { self.inner.device.destroy_buffer(g.buffer, None) };
+            let mut mem = self
+                .pool(&g.alloc)
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             mem.free(&self.inner.device, g.alloc);
         }
     }
@@ -1020,7 +1072,7 @@ impl VulkanDevice {
             return;
         }
         drop(exec);
-        let mut mem = self.inner.mem.lock().unwrap_or_else(|p| p.into_inner());
+        let mut mem = self.pool(&alloc).lock().unwrap_or_else(|p| p.into_inner());
         unsafe { self.inner.device.destroy_buffer(buffer, None) };
         mem.free(&self.inner.device, alloc);
     }
@@ -1034,7 +1086,7 @@ impl VulkanDevice {
             .checked_mul(numel)
             .ok_or_else(|| Error::Msg("vulkan: overflow in storage size".into()))?;
         let capacity = bytes.div_ceil(4).max(1) * 4;
-        let (buffer, alloc, mapped) = self.alloc_raw(capacity as u64)?;
+        let (buffer, alloc, mapped) = self.alloc_raw(capacity as u64, false)?;
         Ok(VulkanStorage {
             buffer,
             alloc,
@@ -1046,7 +1098,8 @@ impl VulkanDevice {
         })
     }
 
-    fn alloc_raw(&self, capacity: u64) -> Result<(vk::Buffer, Alloc, *mut u8)> {
+    /// `scratch`: from the scratch allocator (memory the host never reads).
+    fn alloc_raw(&self, capacity: u64, scratch: bool) -> Result<(vk::Buffer, Alloc, *mut u8)> {
         let dev = &self.inner.device;
         let buffer = unsafe {
             dev.create_buffer(
@@ -1059,7 +1112,12 @@ impl VulkanDevice {
         }
         .map_err(|e| Error::Msg(format!("vulkan create_buffer failed: {e:?}")))?;
         let req = unsafe { dev.get_buffer_memory_requirements(buffer) };
-        let mut mem = self.inner.mem.lock().unwrap_or_else(|p| p.into_inner());
+        let pool = if scratch {
+            &self.inner.scratch_mem
+        } else {
+            &self.inner.mem
+        };
+        let mut mem = pool.lock().unwrap_or_else(|p| p.into_inner());
         if req.memory_type_bits & (1 << mem.mem_type) == 0 {
             unsafe { dev.destroy_buffer(buffer, None) };
             return Err(Error::Msg(format!(
@@ -1958,7 +2016,7 @@ impl BackendStorage for VulkanStorage {
 fn scratch_buf(dev: &VulkanDevice, slot: &mut Option<QuantGemmScratch>, bytes: u64) -> Result<Buf> {
     let bytes = bytes.max(4);
     if slot.as_ref().is_none_or(|s| s.capacity < bytes) {
-        let (buffer, alloc, _) = dev.alloc_raw(bytes)?;
+        let (buffer, alloc, _) = dev.alloc_raw(bytes, true)?;
         if let Some(old) = slot.replace(QuantGemmScratch {
             buffer,
             alloc,
@@ -2859,7 +2917,7 @@ impl QVulkanStorage {
                 // submission in the recorder, after complete dispatch recording.
                 dev.exec().batch_limit = kernels::PREFILL_MAX_LAUNCHES;
                 if scratch.as_ref().is_none_or(|s| s.capacity < bytes) {
-                    let (buffer, alloc, _) = dev.alloc_raw(bytes)?;
+                    let (buffer, alloc, _) = dev.alloc_raw(bytes, false)?;
                     if let Some(old) = scratch.replace(QuantGemmScratch {
                         buffer,
                         alloc,
